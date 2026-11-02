@@ -77,6 +77,7 @@ You need:
 | Site (lat, lon) | `LIGHTKEEPER_SITE`, for example `51.48,-0.0` | 0, 0. Set this before scheduling on sun events. |
 | Time zone for names and schedules | `LIGHTKEEPER_TZ`, an IANA name | `America/New_York` |
 | Python | `LIGHTKEEPER_PYTHON` | first `pythonw.exe` on PATH |
+| Open the spectrometer on start | `LIGHTKEEPER_AUTOCONNECT` (`0` = off) | on |
 
 The window remembers the last run folder and site you used.
 

@@ -9,6 +9,10 @@ ASD line lists is built in.
 
 
 ## Start
+On opening, LightKeeper connects the first attached Ocean spectrometer and starts the live view at a fixed 100 ms (one
+scan per update), as OceanView does. Spectrometers plugged in later are picked up within about 5 s. Press
+**Disconnect** to release it (it is not reopened until the next start); `LIGHTKEEPER_AUTOCONNECT=0` turns this off.
+
 - **Launch:** double-click `Launch_LightKeeper.cmd`. It uses the first `pythonw.exe` on PATH;
   set `LIGHTKEEPER_PYTHON` to override.
 - **Close OceanView first.** Only one program can hold a USB spectrometer.
@@ -20,7 +24,7 @@ ASD line lists is built in.
 |---|---|
 | Header | Run name (hover for the full folder path); the state indicator; the clock; **Hide setup / Show setup** (Ctrl+B); **More** (open run folder, resume an unfinished run, open log folder, about); **Full screen** (F11). |
 | Metric strip | Slots recorded, integration time, scans per slot, peak counts, saturated slots, bursts, dark sets and data written. On the right: the next event (start countdown, next burst, stop) and the background recorder it is attached to. |
-| Setup panel | Spectrometer; Live view; Run (label, geometry, notes, folder); Schedule; Acquisition (time slot, integration range, bursts, dark sets). **Show advanced settings** opens the ladder, dark time per integration time, SD storage, site and restart resume. |
+| Setup panel | Spectrometer; Live view (with **Take dark set…**); Run (label, geometry, notes, folder); Schedule; Acquisition (time slot, integration range, bursts, dark sets). **Show advanced settings** opens the ladder, dark time per integration time, SD storage, site and restart resume. |
 | Spectrum tab | **Live scan:** counts or counts/s, the matched dark and the saturation line. **Wavelength strip:** each wavelength in its colour, fading into the UV and the NIR. **Recent slots:** the last 24, newest brightest. The toolbar has navigation, Auto-scale, **Fit y** and **Display** (dark subtraction, counts/s, log y, hide hot/cold pixels, calibrated axis). |
 | Waterfall | Recorded spectra over time, as raw counts or as spectral shape normalised in a band you choose. |
 | Time series | Band-integrated signal, integration time and saturation over the run. |
@@ -108,6 +112,12 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
     view hides those pixels outside a run as well.
   - The list is metadata only: raw spectra are never altered. **Display → Hide hot and cold pixels** (on by default)
     bridges them in the live scan, the recent slots and the waterfall.
+  - **Take dark set…** (Live view) finds them without a run: cover the input, and LightKeeper takes 5 scans at the
+    longest integration time of the Acquisition range (and 5 at the live view's current time). The list is saved for
+    the spectrometer and the live view gets a matched dark. Nothing is written to a run folder, and a run always
+    starts from its own dark sets.
+  - The live-view readout says how many pixels are hidden, or "no hot-pixel list" when none is saved yet.
+- **Window log:** the Log tab is also written to `%LOCALAPPDATA%\LightKeeper\logs\window_<date>.log`.
 - **Crash safety:** a file is opened only during its 30 s flush, so a crash loses at most that buffer.
 - **Sleep:** Windows sleep is blocked while a run is active.
 
@@ -116,8 +126,14 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
    - **Discharge and calibration lamps:** UVC germicidal (Hg + Ar fill), Hg-Ar, Hg, Ne, Ar, Ne+Ar, He, H (Balmer), Kr,
      Xe, Cd, Zn.
    - **Na:** check only. D1/D2 blend at this resolution, and Na has too few isolated lines to calibrate on its own.
-2. Acquire a dark (lamp off) and the lamp spectrum, at the same integration time and with no saturation.
+2. **1. Acquire dark, lamp off:** darks at every integration time of the ladder plus the calibration time (the
+   **Dark time each** setting per time, at least 5 scans). The longest one also finds the hot and cold pixels. Then
+   **2. Acquire lamp**, with no saturation. The lamp is matched to the dark at its own integration time, so you can
+   change the calibration time to any ladder time without new darks. The next step is highlighted in yellow
+   throughout: 1, then 2, then 3, then Save.
 3. Fit. The procedure:
+   - **Hot and cold pixels:** bridged from their neighbours in the dark-subtracted lamp spectrum, so they cannot be
+     taken for lines. The saved `calibration.json` lists them.
    - **Peaks:** found by prominence ≥ S/N × noise. Saturated peaks are rejected. Peak positions use a 3-point parabola.
    - **Reference lines:** NIST lines above the minimum relative intensity and isolated, with no other candidate line
      within 1 nm.

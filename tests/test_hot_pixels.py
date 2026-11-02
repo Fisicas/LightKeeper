@@ -87,5 +87,32 @@ class TestRunAndReconnect(unittest.TestCase):
                     os.environ["LIGHTKEEPER_HOME"] = old
 
 
+class TestDarkSetOutsideRun(unittest.TestCase):
+    def test_live_dark_finds_and_saves_hot_pixels(self):
+        with tempfile.TemporaryDirectory() as home:
+            old = os.environ.get("LIGHTKEEPER_HOME"); os.environ["LIGHTKEEPER_HOME"] = home
+            try:
+                eng = Engine(); eng.start(); ev = []
+                eng.send("connect", SIM_ID, True, True)
+                wait_for(eng, lambda e: e["type"] == "state" and e["state"] == "IDLE", 10, ev)
+                eng.send("preview", True, False, 100)
+                wait_for(eng, lambda e: e["type"] == "state" and e["state"] == "PREVIEW", 10, ev)
+                eng.send("live_dark", 200_000, 100_000, 5)
+                got = wait_for(eng, lambda e: e["type"] == "hot_pixels", 30, ev)
+                self.assertEqual(got["hot"], SIM_HOT); self.assertEqual(got["int_us"], 200_000)
+                darks = [e for e in ev if e["type"] == "darks"][-1]["darks"]
+                self.assertEqual(sorted(darks), [100_000, 200_000])
+                states = [e["state"] for e in ev if e["type"] == "state"]
+                self.assertEqual(states[-2:], ["DARK", "PREVIEW"])              # live view restored
+                self.assertEqual(eng.dev.int_us, 100_000)
+                self.assertEqual(hotpix.load("SIM0001")["label"], "live view")
+                eng.send("quit"); eng.join(10)
+            finally:
+                if old is None:
+                    os.environ.pop("LIGHTKEEPER_HOME", None)
+                else:
+                    os.environ["LIGHTKEEPER_HOME"] = old
+
+
 if __name__ == "__main__":
     unittest.main()

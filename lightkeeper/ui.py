@@ -46,6 +46,7 @@ BG, PANEL, MUTED, GOLD, TEAL, PURPLE = theme.GROUND, SURFACE, TEXT2, LAMP, theme
 STYLESHEET = theme.STYLESHEET
 STATE = theme.STATE
 matplotlib.rcParams.update(theme.mpl_rc())
+LIVE_START_MS = 100       # live view on opening: fixed integration, one scan per update (no averaging)
 RUN_STATES = ("DARK", "AWAIT_UNCOVER", "STANDBY", "RECORDING", "BURST", "POST_RUN", "WAITING_DEVICE")
 RECENT_CMAP = matplotlib.colors.LinearSegmentedColormap.from_list("lk_recent", ["#3d4652", "#8c7448", LAMP])
 THOUSANDS = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
@@ -164,6 +165,27 @@ class DateTimeEdit(Q.QDateTimeEdit):
             ev.ignore()
 
 
+def site_text(lat, lon) -> str:
+    return f"{abs(lat):.4f}° {'N' if lat >= 0 else 'S'}, {abs(lon):.4f}° {'E' if lon >= 0 else 'W'}"
+
+
+def site_problem(lat, lon) -> str:
+    """Why sun times for this site would be wrong, or ''. Catches an unset site and a longitude whose solar noon is far
+    from midday on the local clock (almost always a missing minus sign: west longitudes are negative)."""
+    if (lat, lon) == (0.0, 0.0):
+        return "Site not set (0°, 0°): sun times are for 0° N 0° E."
+    def off(lo):
+        noon = sun_events(dt.datetime.now(LOCAL_TZ).date(), lat, lo)["solar noon"]
+        return noon, noon.hour + noon.minute / 60 - 12
+    noon, h = off(lon)
+    if abs(h) <= 3:
+        return ""
+    msg = f"Solar noon at this site is {noon:%H:%M} on the local clock ({LOCAL_TZ}), which does not fit the time zone. "
+    if abs(off(-lon)[1]) <= 3:
+        return msg + f"West longitudes are negative: did you mean {-lon:.5f}°?"
+    return msg + "Check the longitude (west is negative) or set LIGHTKEEPER_TZ to the site's time zone."
+
+
 def dspin(lo, hi, val, dec=1, step=1.0, suffix=""):
     s = SpinBox(); s.setRange(lo, hi); s.setDecimals(dec); s.setSingleStep(step); s.setValue(val)
     s.setKeyboardTracking(False)
@@ -177,7 +199,10 @@ class Window(Q.QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {VERSION}"); self.setWindowIcon(icon()); self.resize(1600, 960)
         self.auto_confirm = auto_confirm
-        self.settings = QtCore.QSettings("LightKeeper", "LightKeeper")
+        if os.environ.get("LIGHTKEEPER_HOME"):    # tests and portable setups keep their settings beside their app home
+            self.settings = QtCore.QSettings(str(app_home() / "settings.ini"), QtCore.QSettings.Format.IniFormat)
+        else:
+            self.settings = QtCore.QSettings("LightKeeper", "LightKeeper")
         self.engine = Engine(); self.engine.start()
         self.state = "DISCONNECTED"; self.info = {}; self.wl_dev = None; self.axis = None; self.axis_label = "device axis"
         self.latest = None; self.latest_int = None; self.darks = {}; self.valid = None; self.hot = None
@@ -185,7 +210,11 @@ class Window(Q.QMainWindow):
         self.run_dir = None; self.plan = None; self.run_plan = None; self.run_times = None; self.cal = {}; self.cal_result = None; self.n_bursts = 0; self._last_ts_draw = 0.0
         self._dialog = False; self._last_live = 0; self._scan_new = False
         self.link = None; self._expect_attach = None; self._closed_run = False; self._a1_ylim = None; self._last_attach_try = 0.0
+        # like OceanView: open the first attached spectrometer and show single 100 ms scans, without pressing Connect.
+        # Off after the user disconnects; a device that failed to open is not retried until the attached set changes.
+        self._auto = os.environ.get("LIGHTKEEPER_AUTOCONNECT", "1") != "0"; self._auto_live = False; self._auto_failed = None; self._last_auto_try = 0.0
         self._build()
+        self.exp_mode.setCurrentIndex(1); self.int_spin.setValue(LIVE_START_MS)
         self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self._poll); self.timer.start(50)
         self.slow = QtCore.QTimer(self); self.slow.timeout.connect(self._slow_tick); self.slow.start(1000)
         if not self._try_attach():
@@ -269,6 +298,10 @@ class Window(Q.QMainWindow):
         self.int_spin = dspin(1, 60000, 500, 1, 10, "ms"); f.addRow("Integration", self.int_spin)
         self.btn_preview = Q.QPushButton("Start live view"); self.btn_apply = Q.QPushButton("Apply")
         lay.addWidget(hbox(self.btn_preview, self.btn_apply, stretch_first=False))
+        self.btn_dark = Q.QPushButton("Take dark set…")
+        self.btn_dark.setToolTip("Cover the input: 5 scans at the longest integration time (Acquisition, 'to') find the hot and "
+                                 "cold pixels for this spectrometer, plus a matched dark for the live view. No run is needed.")
+        lay.addWidget(self.btn_dark)
 
         section(lay, "Run")
         f = form(lay)
@@ -343,6 +376,12 @@ class Window(Q.QMainWindow):
         self.lat = dspin(-90, 90, float(self.settings.value("site_lat", DEFAULT_SITE[0])), 5, 0.01, "°")
         self.lon = dspin(-180, 180, float(self.settings.value("site_lon", DEFAULT_SITE[1])), 5, 0.01, "°")
         f.addRow("Site", hbox(self.lat, self.lon, stretch_first=False))
+        self.lat.setToolTip("Latitude in degrees: north positive, south negative")
+        self.lon.setToolTip("Longitude in degrees: east positive, WEST NEGATIVE (the Americas are negative)")
+        self.site_lbl = Q.QLabel(""); self.site_lbl.setObjectName("secondary"); self.site_lbl.setWordWrap(True); f.addRow("", self.site_lbl)
+        for w_ in (self.lat, self.lon):
+            w_.valueChanged.connect(lambda *_: self._show_site())
+        self._show_site()
         self.cb_logon = Q.QCheckBox("Resume after a Windows restart"); self.cb_logon.setChecked(True)
         self.cb_logon.setToolTip("At the next logon. A per-run entry in HKCU\\...\\Run, removed when the run closes or is interrupted on purpose.")
         f.addRow("", self.cb_logon)
@@ -361,6 +400,7 @@ class Window(Q.QMainWindow):
 
         self.btn_refresh.clicked.connect(self._refresh_devices); self.btn_connect.clicked.connect(self._connect)
         self.btn_preview.clicked.connect(self._toggle_preview); self.btn_apply.clicked.connect(self._apply_preview)
+        self.btn_dark.clicked.connect(self._live_dark)
         self.btn_start.clicked.connect(self._start_run); self.btn_stop.clicked.connect(self._stop_run)
         self.exp_mode.currentIndexChanged.connect(lambda *_: self.int_spin.setEnabled(True))
         for wdg in (self.start_mode, self.stop_mode):
@@ -491,10 +531,17 @@ class Window(Q.QMainWindow):
         self.cal_iso = dspin(0.1, 5, 1.0, 2, 0.1, "nm"); f.addRow("Isolation", self.cal_iso)
         self.cal_snr = dspin(3, 500, 15, 0, 5); f.addRow("Peak S/N", self.cal_snr)
         self.cal_deg = IntSpin(); self.cal_deg.setRange(1, 4); self.cal_deg.setValue(3); f.addRow("Polynomial degree", self.cal_deg)
-        for txt, fn, obj in [("1. Acquire dark, lamp off", lambda: self._cal_acquire("dark"), ""), ("2. Acquire lamp", lambda: self._cal_acquire("lamp"), ""),
-                             ("3. Fit to NIST lines", self._cal_fit, "primary"), ("Save calibration", self._cal_save, ""),
-                             ("Use for the display axis", self._cal_use, ""), ("Load calibration…", self._cal_load, "flat")]:
-            b = Q.QPushButton(txt); b.clicked.connect(fn); b.setObjectName(obj); l.addWidget(b)
+        self.cal_btn = {}
+        for key, txt, fn, obj in [("dark", "1. Acquire dark, lamp off", lambda: self._cal_acquire("dark"), ""),
+                                  ("lamp", "2. Acquire lamp", lambda: self._cal_acquire("lamp"), ""),
+                                  ("fit", "3. Fit to NIST lines", self._cal_fit, ""), ("save", "Save calibration", self._cal_save, ""),
+                                  ("use", "Use for the display axis", self._cal_use, ""), ("load", "Load calibration…", self._cal_load, "flat")]:
+            b = Q.QPushButton(txt); b.clicked.connect(fn); b.setObjectName(obj); l.addWidget(b); self.cal_btn[key] = b
+        self.cal_btn["dark"].setToolTip("Lamp off or input covered. Darks at every integration time of the ladder and the "
+                                        "calibration time, and the hot and cold pixels from the longest one.")
+        self.cal_darks = {}; self._cal_saved = False
+        self.cal_int.valueChanged.connect(lambda *_: self._cal_steps())
+        self.lamp_combo.currentIndexChanged.connect(lambda *_: (self.cal.pop("lamp", None), setattr(self, "cal_result", None), self._cal_steps()))
         self.cal_text = Q.QPlainTextEdit(); self.cal_text.setReadOnly(True); self.cal_text.setStyleSheet("font-family: Consolas; font-size: 9pt;")
         l.addWidget(self.cal_text, 1)
         h.addWidget(p)
@@ -502,6 +549,28 @@ class Window(Q.QMainWindow):
         self.c_cal.ax[0].set_title("Lamp spectrum, dark-subtracted, with NIST reference lines")
         self.c_cal.ax[1].set_title("Fit residual (NIST − fit)")
         self.tabs.addTab(w, "Calibration")
+        self._cal_steps()
+
+    def _cal_step(self) -> str:
+        """The next calibration step: darks covering the calibration time -> lamp -> fit -> save."""
+        us = int(round(self.cal_int.value() * 1000))
+        if not any(abs(k - us) <= max(1, us * 0.01) for k in self.cal_darks):
+            return "dark"
+        lamp = self.cal.get("lamp")
+        if lamp is None or abs(lamp["int_us"] - us) > max(1, us * 0.01):
+            return "lamp"
+        if not (self.cal_result and self.cal_result.get("ok")):
+            return "fit"
+        return "" if self._cal_saved else "save"
+
+    def _cal_steps(self):
+        nxt = self._cal_step()
+        for k, b in self.cal_btn.items():
+            if k == "load":
+                continue
+            want = "primary" if k == nxt else ""
+            if b.objectName() != want:
+                b.setObjectName(want); b.style().unpolish(b); b.style().polish(b)
 
     def _tab_events(self):
         self.log_box = Q.QPlainTextEdit(); self.log_box.setReadOnly(True); self.log_box.setStyleSheet("font-family: Consolas; font-size: 9pt;")
@@ -521,6 +590,7 @@ class Window(Q.QMainWindow):
         self.btn_resume.setEnabled(self.link is None and self._expect_attach is None and s in ("DISCONNECTED", "IDLE", "PREVIEW"))
         self.btn_preview.setEnabled(s in ("IDLE", "PREVIEW")); self.btn_preview.setText("Stop live view" if s == "PREVIEW" else "Start live view")
         self.btn_apply.setEnabled(s in ("IDLE", "PREVIEW"))
+        self.btn_dark.setEnabled(s in ("IDLE", "PREVIEW") and self.link is None)
         self.btn_start.setEnabled(s in ("IDLE", "PREVIEW") and self.link is None)
         self.btn_stop.setEnabled(self.link is not None and s in ("STANDBY", "RECORDING", "BURST", "AWAIT_UNCOVER"))
         self.a_open_run.setEnabled(self.run_dir is not None)
@@ -544,11 +614,26 @@ class Window(Q.QMainWindow):
         if self.state == "DISCONNECTED":
             self.engine.send("connect", self.dev_combo.currentData(), self.cb_edc.isChecked(), self.cb_nlc.isChecked())
         else:
+            self._auto = False             # the user chose to let go of the spectrometer: do not grab it again
             self.engine.send("disconnect")
 
     def _toggle_preview(self):
         on = self.state != "PREVIEW"
         self.engine.send("preview", on, self.exp_mode.currentIndex() == 0, self.int_spin.value() if self.exp_mode.currentIndex() == 1 else None)
+
+    def _show_site(self):
+        lat, lon = self.lat.value(), self.lon.value(); bad = site_problem(lat, lon)
+        self.site_lbl.setText(site_text(lat, lon) + (f"\n{bad}" if bad else ""))
+        self.site_lbl.setStyleSheet(f"color: {ORANGE}" if bad else "")
+
+    def _live_dark(self):
+        hot_ms = max(self.max_spin.value(), self.int_spin.value())
+        live_ms = (self.latest_int or 0) / 1000 or None
+        txt = (f"Cover the input completely, then press Record.\n\n5 scans at {hot_ms:g} ms"
+               + (f" and 5 at {live_ms:g} ms (the live view's current time)" if live_ms and abs(live_ms - hot_ms) > 1e-6 else "")
+               + " find this spectrometer's hot and cold pixels and give the live view a matched dark. Nothing is saved to a run.")
+        if self._ask("Dark set", txt, "Record", "Cancel"):
+            self.engine.send("live_dark", int(hot_ms * 1000), int(live_ms * 1000) if live_ms else None, 5)
 
     def _apply_preview(self):
         self.engine.send("preview", self.state == "PREVIEW", self.exp_mode.currentIndex() == 0, self.int_spin.value())
@@ -594,6 +679,12 @@ class Window(Q.QMainWindow):
 
     def _start_run(self):
         plan = self._plan()
+        bad = site_problem(plan.site_lat, plan.site_lon) if (plan.start_event or plan.stop_event) else ""
+        if bad and (plan.site_lat, plan.site_lon) == (0.0, 0.0):
+            Q.QMessageBox.warning(self, APP_NAME, bad + "\n\nSet the latitude and longitude under Show advanced settings → Site.")
+            return
+        if bad and not self._ask("Check the site", bad + "\n\nStart with these sun times anyway?", "Start anyway", "Cancel"):
+            return
         e = estimates(plan, len(self.wl_dev) if self.wl_dev is not None else 2068, int(self.info.get("min_int_us_used", 8000)), int(self.info.get("max_int_us", 6e7)))
         if e["stop"] <= max(e["start"], dt.datetime.now(LOCAL_TZ)):
             Q.QMessageBox.warning(self, APP_NAME, "The stop time must be in the future and after the start time."); return
@@ -708,6 +799,11 @@ class Window(Q.QMainWindow):
                 self._on_slot(e)
             elif t == "state":
                 self._set_state(e["state"], e.get("detail", ""))
+                if self._auto_live and e["state"] == "IDLE":
+                    self._auto_live = False; self._auto_failed = None
+                    self.engine.send("preview", True, False, self.int_spin.value())
+                elif self._auto_live and e["state"] == "DISCONNECTED":
+                    self._auto_failed = self._auto_live; self._auto_live = False
                 if e["state"] == "AWAIT_UNCOVER":
                     QtCore.QTimer.singleShot(50, self._ask_uncover)
                 if e["state"] not in ("DARK", "LAMP"):
@@ -753,7 +849,12 @@ class Window(Q.QMainWindow):
                 self._set_setup_visible(self.settings.value("setup_visible", True, type=bool), remember=False)
                 self.run_plan = None; self.run_times = None; self._update_schedule()
             elif t == "lamp_result":
-                self.cal[e["kind"]] = e; self._log(f"calibration {e['kind']}: {e['n']} scans at {e['int_us'] / 1000:g} ms"); self._draw_cal()
+                self.cal[e["kind"]] = e; self._log(f"calibration {e['kind']}: {e['n']} scans at {e['int_us'] / 1000:g} ms")
+                if e["kind"] == "lamp":
+                    self.cal_result = None; self._cal_y = None; self._cal_saved = False
+                self._draw_cal(); self._cal_steps()
+            elif t == "dark_set_done":
+                self.cal_darks.update({int(k): np.asarray(v) for k, v in e["darks"].items()}); self._cal_steps()
             elif t == "int":
                 self.m["int"].setText(f"{e['int_us'] / 1000:g}")
             elif t == "run_interrupted":
@@ -824,14 +925,35 @@ class Window(Q.QMainWindow):
             return
         runs = [r for r in open_runs() if not supervisor_alive(r["run_dir"])]
         if not runs:
-            return
+            self._auto_connect(); return
         r = runs[-1]; st = r["state"]
         txt = (f"An unfinished run was found:\n\n{Path(r['run_dir']).name}\nstatus: {st.get('status')} (last phase {st.get('phase')})\n"
                f"last recorded slot: {st.get('last_slot_local') or '-'}\nscheduled stop: {st.get('planned_stop_local')}\n\n"
                "Resume it now? It continues as a new segment until the scheduled stop, or goes straight to the post-run darks "
                "if that time has passed.")
         if self._ask("Resume run", txt, "Resume now", "Not now"):
-            self._resume(r["run_dir"], st.get("serial", ""))
+            self._resume(r["run_dir"], st.get("serial", "")); return
+        self._auto_connect()
+
+    def _auto_connect(self, rescan=False):
+        """Connect the first attached Ocean spectrometer (never the simulator) and start the live view."""
+        if not self._auto or self.link is not None or self._expect_attach is not None or self.state != "DISCONNECTED":
+            return
+        if rescan:
+            if live_sessions():
+                return
+            devs, _ = list_devices(True)
+            if [i for i, _ in devs if i != SIM_ID] and [i for i, _ in devs] != [self.dev_combo.itemData(k) for k in range(self.dev_combo.count())]:
+                self.dev_combo.clear()
+                for i, lab in devs:
+                    self.dev_combo.addItem(lab, i)
+        ids = [self.dev_combo.itemData(k) for k in range(self.dev_combo.count())]
+        real = [i for i in ids if i is not None and i != SIM_ID]
+        if not real or tuple(real) == self._auto_failed:
+            return
+        self.dev_combo.setCurrentIndex(ids.index(real[0])); self._auto_live = tuple(real)
+        self._log(f"opening {self.dev_combo.currentText().strip()} automatically; live view at {LIVE_START_MS} ms")
+        self.engine.send("connect", real[0], self.cb_edc.isChecked(), self.cb_nlc.isChecked())
 
     def _resume_dialog(self):
         runs = [r for r in open_runs() if not supervisor_alive(r["run_dir"])]
@@ -858,6 +980,11 @@ class Window(Q.QMainWindow):
 
     def _log(self, text):
         self.log_box.appendPlainText(text)
+        try:                                   # the window's log also goes to app_home/logs, one file per day
+            with open(app_home() / "logs" / f"window_{dt.date.today():%Y%m%d}.log", "a", encoding="utf-8") as fh:
+                fh.write(f"{dt.datetime.now():%H:%M:%S} {text}\n")
+        except Exception:
+            pass
 
     def _slow_tick(self):
         self.clock.setText(dt.datetime.now(LOCAL_TZ).strftime("%H:%M:%S"))
@@ -869,6 +996,8 @@ class Window(Q.QMainWindow):
                 self._expect_attach = None; self._set_state("DISCONNECTED")
                 Q.QMessageBox.warning(self, APP_NAME, "The background recorder did not start. See the logs in\n"
                                       f"{app_home() / 'logs'}\n\nThen press Refresh and Connect.")
+        if self.state == "DISCONNECTED" and self.link is None and self._expect_attach is None and time.time() - self._last_auto_try > 5:
+            self._last_auto_try = time.time(); self._auto_connect(rescan=True)    # a spectrometer plugged in later
         nxt = self._next_event()
         self.next_lbl.setText(nxt)
         if self._dirty_ts and time.time() - self._last_ts_draw > 4:
@@ -974,7 +1103,9 @@ class Window(Q.QMainWindow):
         peak = float(np.max(y[show])) if show.any() else 0
         hidden = int((~show).sum())
         self.live_info.setText(f"{us / 1000:g} ms, peak {peak:,.0f} counts, {'matched dark available' if d is not None else 'no matched dark'}, "
-                               + (f"{hidden} hot/cold pixels hidden, " if hidden else "") + self.axis_label)
+                               + (f"{hidden} hot/cold pixels hidden, " if hidden else
+                                  ("hot pixels shown, " if not self.cb_mask.isChecked() else "no hot-pixel list (take a dark set), "))
+                               + self.axis_label)
         if force or len(self.spectra) and getattr(self, "_drawn_spec", 0) != len(self.spectra):
             xl = a0.get_xlim()
             a1.cla(); style_ax(a1); a1.set_title("Recent slots, newest brightest")
@@ -1185,7 +1316,9 @@ class Window(Q.QMainWindow):
                               f"about {e['dark_session_s']:.0f} s each ({e['dark_scans_total']:,} scans)"),
                 ("Bursts", f"{len(e['bursts'])} of {plan.burst_s:g} s at {e['burst_int_ms']:g} ms" + (f": {bursts}" if bursts else "")),
                 ("Data", f"About {e['data_gb_uncompressed']:.2f} GB uncompressed; {e['disk_free_gb']:.0f} GB free"),
-                ("Site", f"{plan.site_lat:.4f}°, {plan.site_lon:.4f}°")]
+                ("Site", site_text(plan.site_lat, plan.site_lon) + (
+                    f"<br><span style='color:{ORANGE}'>{site_problem(plan.site_lat, plan.site_lon)} "
+                    f"Set it under Show advanced settings.</span>" if site_problem(plan.site_lat, plan.site_lon) else ""))]
         sun = [(k[0].upper() + k[1:], f"{v:%H:%M:%S}" if v else "–") for k, v in sorted(ev.items(), key=lambda kv: kv[1] or t0)]
         td = f"style='padding:3px 14px 3px 0; color:{TEXT2}; vertical-align:top; white-space:nowrap'"
         html = (f"<div style='color:{TEXT}'>"
@@ -1201,20 +1334,34 @@ class Window(Q.QMainWindow):
     def _cal_acquire(self, kind):
         if self.state not in ("IDLE", "PREVIEW"):
             Q.QMessageBox.information(self, APP_NAME, "Connect a spectrometer and stop any run first."); return
-        msg = ("Turn the lamp OFF (or cover the input) for the dark." if kind == "dark" else
-               f"Turn the {self.lamp_combo.currentText()} lamp ON and aim it at the input. Avoid saturation (peak < 55,000 counts).")
+        if kind == "dark":
+            try:
+                ladder = [int(round(float(x) * 1000)) for x in self.ladder_edit.text().replace(";", ",").split(",") if x.strip()]
+            except ValueError:
+                ladder = []
+            times = sorted(set(ladder) | {int(round(self.cal_int.value() * 1000))})
+            est = sum((max(5, min(30, round(self.dark_s.value() * 1e6 / u))) + 2) * u / 1e6 for u in times)
+            if self._ask("Calibration: dark", f"Turn the lamp OFF (or cover the input) and keep it covered.\n\nDarks at "
+                         f"{len(times)} integration times ({', '.join(f'{u / 1000:g}' for u in times)} ms), about {est:.0f} s. "
+                         "The longest also finds the hot and cold pixels, which are removed before the fit.", "Acquire", "Cancel"):
+                self.engine.send("live_dark", max(times), None, 5, times, self.dark_s.value(), "calibration")
+            return
+        msg = f"Turn the {self.lamp_combo.currentText()} lamp ON and aim it at the input. Avoid saturation (peak < 55,000 counts)."
         if self._ask("Calibration", msg, "Acquire", "Cancel"):
             self.engine.send("lamp", kind, self.cal_int.value(), self.cal_n.value(), self.lamp_combo.currentText())
 
     def _cal_fit(self):
         if "lamp" not in self.cal:
             Q.QMessageBox.information(self, APP_NAME, "Acquire a lamp spectrum first."); return
-        lamp = self.cal["lamp"]; dark = self.cal.get("dark")
-        if dark is None or dark["int_us"] != lamp["int_us"]:
+        lamp = self.cal["lamp"]; dark = self._cal_matched_dark()
+        if dark is None:
             self._log("calibration: no dark at the same integration time -> UV-floor pedestal used instead")
             base = np.median(lamp["mean"][(self.wl_dev > 205) & (self.wl_dev < 290)]); y = lamp["mean"] - base; dmean = np.full(len(y), base)
         else:
-            y = lamp["mean"] - dark["mean"]; dmean = dark["mean"]
+            y = lamp["mean"] - dark; dmean = dark
+        if self.valid is not None and not self.valid.all():
+            y = hotpix.fill(y, self.valid)          # hot and cold pixels from the dark set must not look like lines
+            self._log(f"calibration: {int((~self.valid).sum())} hot/cold pixels bridged before peak finding")
         r = fit_calibration(self.wl_dev, y, self.lamp_combo.currentText(), deg=self.cal_deg.value(), min_rel=self.cal_minrel.value(),
                             isolation_nm=self.cal_iso.value(), snr=self.cal_snr.value(), raw_max=lamp["raw_max"])
         self.cal_result = r; self._cal_y = y; self._cal_dark = dmean
@@ -1228,7 +1375,16 @@ class Window(Q.QMainWindow):
             f"OceanView coefficients (pixel 0..N-1)\n  Intercept  {ov['intercept']}\n  1st        {ov['c1']}\n  2nd        {ov['c2']}\n  3rd        {ov['c3']}\n\n"
             f"device axis − new axis (nm):\n  " + "  ".join(f"{k}: {v:+.3f}" for k, v in r["device_minus_fit_at"].items()) +
             "\n\nThe device EEPROM is NOT changed. Recorded data always keep the device axis + pixel index;\napply the saved calibration in analysis.")
-        self._draw_cal()
+        self._draw_cal(); self._cal_steps()
+
+    def _cal_matched_dark(self):
+        """Mean dark at the lamp's integration time: from the dark set (step 1), else a single-time dark."""
+        us = self.cal["lamp"]["int_us"]
+        for k, v in self.cal_darks.items():
+            if abs(k - us) <= max(1, us * 0.01):
+                return v
+        d = self.cal.get("dark")
+        return d["mean"] if d is not None and d["int_us"] == us else None
 
     def _draw_cal(self):
         a0, a1 = self.c_cal.ax; a0.cla(); a1.cla(); style_ax(a0); style_ax(a1)
@@ -1239,7 +1395,10 @@ class Window(Q.QMainWindow):
         if "lamp" in self.cal:
             y = getattr(self, "_cal_y", None)
             if y is None:
-                y = self.cal["lamp"]["mean"] - (self.cal["dark"]["mean"] if "dark" in self.cal else 0)
+                d = self._cal_matched_dark()
+                y = self.cal["lamp"]["mean"] - (d if d is not None else 0)
+                if self.valid is not None:
+                    y = hotpix.fill(y, self.valid)
             a0.plot(x, y, color=TEAL, lw=0.7)
             a0.axhline(SAT_LEVEL, color=RED, ls="--", lw=0.6)
             refs = reference_lines(self.lamp_combo.currentText(), float(x[5]), float(x[-5]), self.cal_minrel.value(), self.cal_iso.value())
@@ -1264,9 +1423,12 @@ class Window(Q.QMainWindow):
         folder = Path(self.out_edit.text()).parent / "calibrations"
         lamp = self.cal["lamp"]
         meta = dict(app=f"{APP_NAME} {VERSION}", device=self.info, lamp_int_us=lamp["int_us"], lamp_scans=lamp["n"],
-                    lamp_time_local=local_dt(lamp["t_ns"]).isoformat(), dark=bool("dark" in self.cal), notes=self.notes_edit.text())
+                    lamp_time_local=local_dt(lamp["t_ns"]).isoformat(), dark=self._cal_matched_dark() is not None,
+                    hot_cold_pixels_bridged=[int(i) for i in np.flatnonzero(~self.valid)] if self.valid is not None else [],
+                    notes=self.notes_edit.text())
         out = save_calibration(folder, r, self.wl_dev, self._cal_y, self._cal_dark, lamp["raw_max"], meta)
         self._log(f"calibration saved: {out}"); self.statusBar().showMessage(f"calibration saved to {out}", 10000)
+        self._cal_saved = True; self._cal_steps()
 
     def _cal_use(self, r=None):
         r = r or self.cal_result

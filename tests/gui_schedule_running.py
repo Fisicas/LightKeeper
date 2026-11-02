@@ -1,12 +1,15 @@
 """Regression test (0.1.1): while a run is armed/recording, the Schedule tab must show the times fixed at Start, not a
 sun-event plan re-resolved from 'now' (which after today's dawn gives tomorrow's events). Off-screen, no hardware.
-Run:  set QT_QPA_PLATFORM=offscreen & python -X utf8 tests\\test_schedule_display_running.py [screenshot folder]"""
+Run:  set QT_QPA_PLATFORM=offscreen & python -X utf8 tests\\gui_schedule_running.py [screenshot folder]"""
 import datetime as dt
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["LIGHTKEEPER_HOME"] = tempfile.mkdtemp(prefix="lk_sched_")   # keeps the window's settings away from the user's
+os.environ["LIGHTKEEPER_AUTOCONNECT"] = "0"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PySide6 import QtWidgets as Q  # noqa: E402
 from lightkeeper import ui  # noqa: E402

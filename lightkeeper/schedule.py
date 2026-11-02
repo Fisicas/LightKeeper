@@ -175,9 +175,13 @@ SUN_EVENTS = {
 
 def sun_events(day_local: dt.date, lat: float, lon: float) -> dict:
     """All SUN_EVENTS plus 'solar noon' for one local calendar day; crossing times interpolated on a 1-min grid (~1 s)."""
-    t0 = dt.datetime.combine(day_local, dt.time(0, 0), tzinfo=LOCAL_TZ)
-    tl = [t0 + dt.timedelta(minutes=i) for i in range(24 * 60 + 1)]
-    tu = np.array([t.astimezone(dt.timezone.utc).replace(tzinfo=None) for t in tl], dtype="datetime64[ns]")
+    # a 1-min grid in real (UTC) time from local midnight to the next local midnight: 23, 24 or 25 h. Stepping the local
+    # clock instead would skip the repeated hour in autumn and step through the missing one in spring.
+    u0 = dt.datetime.combine(day_local, dt.time(0, 0), tzinfo=LOCAL_TZ).astimezone(dt.timezone.utc)
+    u1 = dt.datetime.combine(day_local + dt.timedelta(days=1), dt.time(0, 0), tzinfo=LOCAL_TZ).astimezone(dt.timezone.utc)
+    ul = [u0 + dt.timedelta(minutes=i) for i in range(int((u1 - u0).total_seconds() // 60) + 1)]
+    tl = [u.astimezone(LOCAL_TZ) for u in ul]
+    tu = np.array([u.replace(tzinfo=None) for u in ul], dtype="datetime64[ns]")
     el = solar_elevation(tu, lat, lon)
     out = {"solar noon": tl[int(np.argmax(el))]}
     for name, (h, rising) in SUN_EVENTS.items():
@@ -185,7 +189,7 @@ def sun_events(day_local: dt.date, lat: float, lon: float) -> dict:
         idx = np.where((d[:-1] < 0) & (d[1:] >= 0))[0] if rising else np.where((d[:-1] >= 0) & (d[1:] < 0))[0]
         if len(idx):
             i = idx[0]; f = d[i] / (d[i] - d[i + 1])
-            out[name] = tl[i] + dt.timedelta(minutes=float(f))
+            out[name] = (ul[i] + dt.timedelta(minutes=float(f))).astimezone(LOCAL_TZ)
         else:
             out[name] = None
     return out
@@ -201,9 +205,13 @@ def next_sun_event(name: str, after: dt.datetime, lat: float, lon: float) -> dt.
 
 def solar_day(day_local: dt.date, lat: float, lon: float):
     """(times local, elevation deg, sunrise, noon, sunset) on a 1-min grid; rise/set at -0.833 deg."""
-    t0 = dt.datetime.combine(day_local, dt.time(0, 0), tzinfo=LOCAL_TZ)
-    tl = [t0 + dt.timedelta(minutes=i) for i in range(24 * 60 + 1)]
-    tu = np.array([t.astimezone(dt.timezone.utc).replace(tzinfo=None) for t in tl], dtype="datetime64[ns]")
+    # a 1-min grid in real (UTC) time from local midnight to the next local midnight: 23, 24 or 25 h. Stepping the local
+    # clock instead would skip the repeated hour in autumn and step through the missing one in spring.
+    u0 = dt.datetime.combine(day_local, dt.time(0, 0), tzinfo=LOCAL_TZ).astimezone(dt.timezone.utc)
+    u1 = dt.datetime.combine(day_local + dt.timedelta(days=1), dt.time(0, 0), tzinfo=LOCAL_TZ).astimezone(dt.timezone.utc)
+    ul = [u0 + dt.timedelta(minutes=i) for i in range(int((u1 - u0).total_seconds() // 60) + 1)]
+    tl = [u.astimezone(LOCAL_TZ) for u in ul]
+    tu = np.array([u.replace(tzinfo=None) for u in ul], dtype="datetime64[ns]")
     el = solar_elevation(tu, lat, lon)
     up = np.where(el > -0.833)[0]
     rise = tl[up[0]] if len(up) else None; sset = tl[up[-1]] if len(up) else None

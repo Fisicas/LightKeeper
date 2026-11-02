@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.5 (2026-11-01)
+- **Opens the spectrometer by itself.** Like OceanView, the window opens the first attached Ocean spectrometer and
+  starts the live view at a fixed 100 ms, one scan per update, without pressing Connect. A spectrometer plugged in
+  later is picked up within about 5 s. After you press Disconnect it is left alone until the next start, and a device
+  that cannot be opened (for example while OceanView holds it) is tried once. The simulator is never opened
+  automatically. `LIGHTKEEPER_AUTOCONNECT=0` turns this off.
+- **Site checks.** The site is shown as N/S and E/W under the fields and in the Schedule panel.
+  - **Unset site (0°, 0°):** flagged, and a run that starts or stops on a sun event is refused until it is set.
+  - **Longitude that does not fit the time zone:** when solar noon falls more than 3 h from midday on the local
+    clock, the window says so and suggests the sign change (west longitudes are negative); a sun-event run asks
+    before it starts.
+- **Calibration steps.**
+  - **1. Acquire dark** now takes darks at every ladder time plus the calibration time, and finds the hot and cold
+    pixels. The lamp is matched to the dark at its own integration time.
+  - Hot and cold pixels are bridged before peak finding and listed in `calibration.json`.
+  - The next step is highlighted in yellow: 1, then 2, then 3, then Save. Changing the lamp or a calibration time
+    that the dark set does not cover moves the highlight back.
+- **Fix: sun times on daylight-saving days.** The 1-minute grid stepped through the local clock, so in autumn it
+  never sampled the repeated hour and in spring it stepped through the missing one. It now steps through real time
+  from local midnight to the next local midnight. Sun events between 01:00 and 03:00 local time were the only ones
+  affected.
+- **Take dark set… without a run.** In Live view, cover the input and press **Take dark set…**: 5 scans at the
+  longest integration time find the hot and cold pixels for this spectrometer, and 5 at the live view's time give it a
+  matched dark. Nothing is written to a run folder; a run still starts from its own dark sets.
+- **Hot-pixel status in the readout.** The live view says how many pixels are hidden, or "no hot-pixel list" when none
+  is saved, and the Log tab says why a saved list was not used.
+- **Window log file.** The Log tab is also written to `%LOCALAPPDATA%\LightKeeper\logs\window_<date>.log`.
+- **Tests keep their settings apart.** With `LIGHTKEEPER_HOME` set, the window keeps its settings in
+  `settings.ini` there. Before, the GUI checks could overwrite the user's saved run folder.
+
 ## 0.3.4 (2026-11-01)
 - **Hot and cold pixels from the dark sets.**
   - After each dark set, the individual scans at the longest integration time are searched: a pixel is listed when it

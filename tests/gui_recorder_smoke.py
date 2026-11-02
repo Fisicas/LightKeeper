@@ -18,6 +18,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 TMP = Path(tempfile.mkdtemp(prefix="lk_gui_"))
 os.environ["LIGHTKEEPER_HOME"] = str(TMP / "home")
+os.environ["LIGHTKEEPER_AUTOCONNECT"] = "0"          # never open a real spectrometer that happens to be plugged in
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PySide6 import QtWidgets as Q  # noqa: E402
 from lightkeeper import procs, ui  # noqa: E402

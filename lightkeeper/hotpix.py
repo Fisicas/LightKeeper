@@ -55,6 +55,10 @@ def _path(serial: str):
     return d / f"{safe}.json"
 
 
+def path_for(serial: str):
+    return _path(serial)
+
+
 def save(serial: str, entry: dict) -> None:
     """Remember the latest list for this spectrometer (never raises)."""
     try:

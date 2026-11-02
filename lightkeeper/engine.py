@@ -266,7 +266,11 @@ class Engine(threading.Thread):
         h = hotpix.load(self.dev.serial)
         if h and len(self.dev.wavelengths) == int(h.get("pixels", -1)):
             self.emit("hot_pixels", hot=h.get("hot", []), cold=h.get("cold", []), int_us=h.get("int_us"),
-                      source=f"saved {h.get('saved_local', '')[:16]} ({h.get('label', '')} darks, {h.get('run', '')})")
+                      source=f"saved {h.get('saved_local', '')[:16]} ({h.get('label', '')} darks {h.get('run', '')})".strip())
+        else:
+            why = "pixel count differs" if h else "none saved yet"
+            self.emit("log", text=f"[{now_local():%H:%M:%S}] hot pixels for {self.dev.serial!r}: {why} "
+                                  f"({hotpix.path_for(self.dev.serial)}); take a dark set to find them")
 
     def _c_disconnect(self):
         if self.state in ("RECORDING", "BURST", "STANDBY", "POST_RUN", "AWAIT_UNCOVER"):
@@ -283,6 +287,50 @@ class Engine(threading.Thread):
         if int_ms:
             self._set_int(int(int_ms * 1000), "preview setting")
         self.set_state("PREVIEW" if on else "IDLE")
+
+    def _c_live_dark(self, hot_us, live_us=None, n=5, more_us=(), dark_s=0.0, purpose="live view"):
+        """Dark set outside a run (the input must be covered): n scans at hot_us find the hot and cold pixels, which are
+        saved for this spectrometer; mean darks at hot_us, live_us and every time in more_us (dark_s seconds each, at
+        least n scans) serve as matched darks for the live view and the calibration. Nothing is written to a run folder."""
+        if self.dev is None or self.ctx is not None or self.state not in ("IDLE", "PREVIEW"):
+            self.emit("error", text="a dark set outside a run needs a connected spectrometer and no active run"); return
+        prev, restore = self.state, self.dev.int_us
+        times = []
+        for u in [hot_us, live_us, *sorted(more_us or (), reverse=True)]:
+            if u and int(u) not in times:
+                times.append(int(u))
+        counts = [max(int(n), dark_scan_count(u, dark_s) if dark_s else 0) for u in times]
+        self.set_state("DARK", "dark set: keep the input covered")
+        if self.dev.simulated:
+            self.dev.mode = "dark"
+        scans, got_hot, done, new = [], None, 0, {}
+        try:
+            for k, (us, cnt) in enumerate(zip(times, counts)):
+                got = self._set_int(us, "dark set", log=False); acc = 0
+                for _ in range(cnt):
+                    y = self._scan(); acc = acc + y; done += 1
+                    if k == 0:
+                        scans.append(y)
+                    self.emit_scan(y)
+                    self.emit("progress", what=f"dark set {got / 1000:g} ms", frac=done / sum(counts))
+                self.darks[got] = new[got] = acc / cnt
+                if k == 0:
+                    got_hot = got
+        finally:
+            if self.dev.simulated:
+                self.dev.mode = "sky"
+            self._set_int(restore, "after dark set", log=False)
+            self.set_state(prev)
+        self.emit("darks", darks={k: v.astype(np.float32) for k, v in self.darks.items()})
+        self.emit("dark_set_done", purpose=purpose, darks={k: v.astype(np.float32) for k, v in new.items()})
+        hot, cold = hotpix.find(scans)
+        hotpix.save(self.dev.serial, dict(hot=hot, cold=cold, int_us=got_hot, n_scans=len(scans), label=purpose,
+                                          run="", pixels=len(self.dev.wavelengths), k=hotpix.K,
+                                          min_fraction=hotpix.MIN_FRACTION))
+        wl = self.dev.wavelengths
+        self.emit("log", text=f"[{now_local():%H:%M:%S}] dark set at {', '.join(f'{u / 1000:g}' for u in times)} ms: "
+                              f"{len(hot)} hot, {len(cold)} cold pixels; hot at " + ", ".join(f"{wl[i]:.1f}" for i in hot[:40]) + " nm")
+        self.emit("hot_pixels", hot=hot, cold=cold, int_us=got_hot, source=f"dark set at {now_local():%H:%M}")
 
     def _c_lamp(self, kind, int_ms, n, lamp_name=""):
         """kind 'dark' or 'lamp': average n scans at int_ms; emits mean, sd and per-pixel raw max."""
@@ -314,6 +362,7 @@ class Engine(threading.Thread):
         if self.dev is None or self.state not in ("IDLE", "PREVIEW"):
             self.emit("error", text="connect a spectrometer (and stop any other activity) before starting a run"); return
         plan = RunPlan.from_dict(plan_dict)
+        self.darks = {}                      # live-view darks never stand in for the run's own
         t_start, t_stop = plan.start_dt(), plan.stop_dt()
         if t_stop <= max(t_start, now_local()):
             self.emit("error", text="stop time must be after the start time and in the future"); return
