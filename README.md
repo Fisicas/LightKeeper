@@ -10,7 +10,7 @@ LightKeeper records a raw spectrum on a fixed time grid, every second, from befo
 watch it. Each run is bracketed by dark sets that cover every integration time the run may use, so no darks are needed
 in the field. Fast bursts store every scan at scheduled times. A background recorder survives a closed window, a crash,
 a USB fault or a Windows restart. It is the sibling of [GammaKeeper](https://github.com/Fisicas/GammaKeeper), with the
-same rules and look, but for light instead of gamma rays. The trace behind the logo is real: daylight through a diffuser
+same rules and look, but for optical spectra (ultraviolet to near-infrared) instead of gamma-ray spectra. The trace behind the logo is real: daylight through a diffuser
 at a forest edge, with the vegetation red edge near 700 nm and both branches of the O₂ A-band at 760 nm, at the detector's full resolution.
 
 ## What it does
