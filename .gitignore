@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# run data and local test output never belong in the repository
+*.h5
+field_runs/
+calibrations/
+_smoke*/
+tests/_*log*.txt
