@@ -25,7 +25,8 @@ scan per update), as OceanView does. Spectrometers plugged in later are picked u
 | Header | Run name (hover for the full folder path); the state indicator; the clock; **Hide setup / Show setup** (Ctrl+B); **More** (open run folder, resume an unfinished run, open log folder, about); **Full screen** (F11). |
 | Metric strip | Slots recorded, integration time, scans per slot, peak counts, saturated slots, bursts, dark sets and data written. On the right: the next event (start countdown, next burst, stop) and the background recorder it is attached to. |
 | Setup panel | Spectrometer; Live view (with **Take dark set…**); Run (label, geometry, notes, folder); Schedule; Acquisition (time slot, integration range, bursts, dark sets). **Show advanced settings** opens the ladder, dark time per integration time, SD storage, site and restart resume. |
-| Spectrum tab | **Save spectrum** (Ctrl+S) writes the scan on screen as a two-column `.dpt` (wavelength nm, signal; OPUS opens it) plus a `.json` with the details, in `<Save in>\..\spectra\`, named `<label>_<date>_<time>` or just the time. **Live scan:** counts or counts/s, the matched dark and the saturation line. **Wavelength strip:** each wavelength in its colour, fading into the UV and the NIR. **Recent slots:** the last 24, newest brightest. The toolbar has navigation, Auto-scale, **Fit y** and **Display** (dark subtraction, counts/s, log y, hide hot/cold pixels, calibrated axis). |
+| Time range (Waterfall, Time series) | **Usable daylight (auto)** draws only where the 420–700 nm dark-corrected signal stays above 1 % of the day's bright level for 5 min; **All data** or **Custom** from/to; **Reset** returns to auto. The range drawn is quoted next to it. **Open recorded run…** shows a finished run read-only, dark-corrected with its pre-run dark set. |
+| Spectrum tab | **Save spectrum** (Ctrl+S) writes the scan on screen as a two-column `.dpt` (wavelength nm, signal; `#` header lines with the main details, which OPUS skips) plus a `.json` with everything, in `<Save in>\..\spectra\`, named `<label>_<date>_<time>` or just the time. **Live scan:** counts or counts/s, the matched dark and the saturation line. **Wavelength strip:** each wavelength in its colour, fading into the UV and the NIR. **Recent slots:** the last 24, newest brightest. The toolbar has navigation, Auto-scale, **Fit y** and **Display** (dark subtraction, counts/s, log y, hide hot/cold pixels, calibrated axis). |
 | Waterfall | Recorded spectra over time, as raw counts or as spectral shape normalised in a band you choose. |
 | Time series | Band-integrated signal, integration time and saturation over the run. |
 | Schedule tab | The plan as a table, plus the sun times, beside the solar-elevation plot. |
@@ -139,6 +140,7 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
      within 1 nm.
    - **Matching:** within 1.5, then 0.8, then 0.5 nm.
    - **Fit:** cubic in pixel, with 3σ clipping. The leave-one-out rms is reported.
+   **Fit y**, the mouse wheel and a double-click scale the calibration plots as on the Spectrum tab.
 4. **Save** writes `calibration.json`, `matched_lines.csv` and `lamp_spectrum.csv`. **Use for display axis** relabels the
    plots.
 
@@ -164,6 +166,8 @@ the source and are not comparable between species; they are used only to select 
   - `tests/gui_recorder_smoke.py`: window close and re-attach, y-scaling and recorder kill.
   - `tests/gui_schedule_running.py`: the Schedule tab during a run.
   - `tests/gui_save_spectrum.py`: Save spectrum file names, the two-column `.dpt` and its `.json`.
+  - `tests/gui_time_range.py [run folder]`: the time range and opening a recorded run read-only (a synthetic day by
+    default; give a real run folder to open that one, which is only read).
 - **Hardware:** dawn-to-dusk field runs on a Maya2000 Pro. The scan period equals the integration time from 8 to 500 ms,
   with no dead time.
 - **Tested only with the simulator so far:**

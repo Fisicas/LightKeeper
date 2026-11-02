@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -38,7 +39,7 @@ from .procs import (app_home, entry_args, live_sessions, open_runs, read_json, s
 from .schedule import SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, solar_day, sun_events  # noqa: E402
 from .storage import LOCAL_TZ, local_dt  # noqa: E402
 
-from . import hotpix, theme  # noqa: E402
+from . import hotpix, runview, theme  # noqa: E402
 from .theme import BLUE, GREEN, LAMP, LINE, ORANGE, RED, SURFACE, TEXT, TEXT2, TEXT3, VIOLET  # noqa: E402
 
 # legacy colour names used by the drawing code, mapped onto the theme tokens
@@ -209,7 +210,7 @@ class Window(Q.QMainWindow):
         self.slots = []; self.spectra = []; self.spec_stride = 1; self._slot_count = 0; self._dirty_ts = False
         self.run_dir = None; self.plan = None; self.run_plan = None; self.run_times = None; self.cal = {}; self.cal_result = None; self.n_bursts = 0; self._last_ts_draw = 0.0
         self._dialog = False; self._last_live = 0; self._scan_new = False
-        self.link = None; self._expect_attach = None; self._closed_run = False; self._a1_ylim = None; self._last_attach_try = 0.0
+        self.viewing = None; self._load = None; self.link = None; self._expect_attach = None; self._closed_run = False; self._a1_ylim = None; self._last_attach_try = 0.0
         # like OceanView: open the first attached spectrometer and show single 100 ms scans, without pressing Connect.
         # Off after the user disconnects; a device that failed to open is not retried until the attached set changes.
         self._auto = os.environ.get("LIGHTKEEPER_AUTOCONNECT", "1") != "0"; self._auto_live = False; self._auto_failed = None; self._last_auto_try = 0.0
@@ -230,8 +231,11 @@ class Window(Q.QMainWindow):
         body = Q.QHBoxLayout(); body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0); v.addLayout(body, 1)
         self.setup = self._left(); body.addWidget(self.setup)
         right = Q.QWidget(); rv = Q.QVBoxLayout(right); rv.setContentsMargins(12, 6, 12, 0); rv.setSpacing(0)
+        self.range_bar = self._range_bar(); rv.addWidget(self.range_bar)
         self.tabs = Q.QTabWidget(); self.tabs.setDocumentMode(True); rv.addWidget(self.tabs); body.addWidget(right, 1)
         self._tab_spectrum(); self._tab_waterfall(); self._tab_timeseries(); self._tab_schedule(); self._tab_calibration(); self._tab_events()
+        self.tabs.currentChanged.connect(lambda i: self.range_bar.setVisible(self.tabs.tabText(i) in ("Waterfall", "Time series")))
+        self.range_bar.setVisible(False)
         self.progress = Q.QProgressBar(); self.progress.setMaximumWidth(260); self.progress.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress)
         self.clock_lbl = Q.QLabel(""); self.statusBar().addPermanentWidget(self.clock_lbl)
@@ -240,6 +244,135 @@ class Window(Q.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self._save_spectrum)
         self._set_setup_visible(self.settings.value("setup_visible", True, type=bool), remember=False)
         self._set_state("DISCONNECTED")
+
+    def _range_bar(self):
+        """Time range for the Waterfall and Time series tabs: the usable daylight (found automatically), all data, or custom."""
+        f = Q.QFrame(); r = Q.QHBoxLayout(f); r.setContentsMargins(0, 4, 0, 6); r.setSpacing(8)
+        lab = Q.QLabel("Time range"); lab.setObjectName("secondary"); r.addWidget(lab)
+        self.range_mode = Q.QComboBox(); self.range_mode.addItems(["Usable daylight (auto)", "All data", "Custom"])
+        self.range_mode.setToolTip(f"Usable daylight: where the 420–700 nm signal stays above {runview.USABLE_FRACTION:.0%} of the "
+                                   f"day's bright level for {runview.USABLE_HOLD_S / 60:g} min. Before dawn and after dusk the "
+                                   "spectra are dark noise, which swamps the waterfall and the ratios.")
+        r.addWidget(self.range_mode)
+        self.range_from = Q.QDateTimeEdit(); self.range_to = Q.QDateTimeEdit()
+        for w_ in (self.range_from, self.range_to):
+            w_.setDisplayFormat("yyyy-MM-dd HH:mm"); w_.setEnabled(False); w_.setKeyboardTracking(False)
+        r.addWidget(self.range_from); t = Q.QLabel("to"); t.setObjectName("secondary"); r.addWidget(t); r.addWidget(self.range_to)
+        self.btn_range_reset = Q.QPushButton("Reset"); self.btn_range_reset.setToolTip("Back to the usable daylight, found automatically")
+        r.addWidget(self.btn_range_reset)
+        self.range_info = Q.QLabel(""); self.range_info.setObjectName("secondary"); r.addWidget(self.range_info); r.addStretch(1)
+        self.btn_open_rec = Q.QPushButton("Open recorded run…"); self.btn_open_rec.clicked.connect(self._open_recorded_run)
+        r.addWidget(self.btn_open_rec)
+        self.range_mode.currentIndexChanged.connect(self._range_mode_changed)
+        self.btn_range_reset.clicked.connect(lambda: self.range_mode.setCurrentIndex(0))
+        for w_ in (self.range_from, self.range_to):
+            w_.dateTimeChanged.connect(lambda *_: self._redraw_ranged())
+        return f
+
+    def _open_recorded_run(self):
+        if self.link is not None or self.state in RUN_STATES or self.run_plan is not None:
+            Q.QMessageBox.information(self, APP_NAME, "A run is being recorded or watched. Open a recorded run when it has finished."); return
+        if self._load is not None:
+            return
+        d = Q.QFileDialog.getExistingDirectory(self, "Recorded run folder (contains spectra_*.h5)", self.out_edit.text())
+        if not d:
+            return
+        if not list(Path(d).glob("spectra_*.h5")):
+            Q.QMessageBox.warning(self, APP_NAME, f"{d}\n\nhas no spectra_*.h5 files."); return
+        self._start_load(d)
+
+    def _start_load(self, d):
+        """Read the run in a worker thread (the files are opened read-only); _poll_load() picks up the result."""
+        self._load = dict(dir=d, frac=0.0, result=None)
+        valid = self.valid if self.valid is not None and not self.valid.all() else None
+        def work(job=self._load):
+            try:
+                job["result"] = runview.load_run(job["dir"], valid=valid, progress=lambda f: job.__setitem__("frac", f))
+            except Exception as e:
+                job["result"] = e
+        threading.Thread(target=work, daemon=True, name="LightKeeperRunLoad").start()
+        self.progress.setVisible(True); self.progress.setFormat(f"reading {Path(d).name}  %p%"); self.progress.setValue(0)
+        self._load_timer = QtCore.QTimer(self); self._load_timer.timeout.connect(self._poll_load); self._load_timer.start(150)
+
+    def _poll_load(self):
+        job = self._load; r = job["result"] if job else None
+        if job is None:
+            self._load_timer.stop(); return
+        if r is None:
+            self.progress.setValue(int(100 * job["frac"])); return
+        self._load_timer.stop(); self._load = None; self.progress.setVisible(False)
+        if isinstance(r, Exception):
+            Q.QMessageBox.warning(self, APP_NAME, f"Could not read the run:\n{r!r}"); return
+        self.slots = r["slots"]; self.spectra = list(r["spectra"]); self.spec_stride = r["stride"]; self._slot_count = len(self.slots)
+        if self.axis is None or len(self.axis) != len(r["wl"]):
+            self.axis = np.asarray(r["wl"]).copy(); self.wl_dev = self.axis.copy() if self.wl_dev is None else self.wl_dev
+        if self.valid is None or len(self.valid) != len(r["wl"]):
+            self.valid = r["valid"]
+        self.viewing = r; self.run_dir = r["dir"]; self.a_open_run.setEnabled(True); self.a_close_rec.setEnabled(True)
+        self.run_lbl.setText(f"Viewing {r['name']} (read-only)"); self.run_lbl.setToolTip(r["dir"])
+        self.m["slots"].setText(f"{r['n_slots']:,}")
+        self.range_mode.setCurrentIndex(0)
+        a, b, txt = self._time_window()
+        self._log(f"opened {r['name']} read-only: {r['n_slots']:,} slots in {len(r['files'])} files, darks from the {r['dark_source']}; "
+                  f"showing {txt}")
+        self._redraw_ranged(); self.tabs.setCurrentIndex(1)
+
+    def _close_recorded_run(self):
+        if self.viewing is None:
+            return
+        self.viewing = None; self.slots.clear(); self.spectra.clear(); self.spec_stride = 1; self._slot_count = 0
+        self.run_lbl.setText("No run"); self.run_lbl.setToolTip(""); self.a_close_rec.setEnabled(False); self.m["slots"].setText("–")
+        for a in list(self.c_ts.ax) + list(self.c_wf.ax):
+            a.cla(); style_ax(a)
+        self.c_ts.draw_idle(); self.c_wf.draw_idle(); self.range_info.setText("")
+
+    def _range_mode_changed(self, i):
+        custom = i == 2
+        for w_ in (self.range_from, self.range_to):
+            w_.setEnabled(custom)
+        if custom and self.slots:            # start the custom range from what is shown now
+            a, b, _ = self._time_window(mode=0)
+            a = a or self.slots[0]["t"]; b = b or self.slots[-1]["t"]
+            for w_, v in ((self.range_from, a), (self.range_to, b)):
+                w_.blockSignals(True)
+                w_.setDateTime(QtCore.QDateTime(QtCore.QDate(v.year, v.month, v.day), QtCore.QTime(v.hour, v.minute)))
+                w_.blockSignals(False)
+        self._redraw_ranged()
+
+    def _redraw_ranged(self):
+        self._draw_timeseries(); self._draw_waterfall()
+
+    def _time_window(self, mode=None):
+        """(start, end, text) of the time range shown; start/end None = no limit."""
+        if not self.slots:
+            self.range_info.setText(""); return None, None, ""
+        mode = self.range_mode.currentIndex() if mode is None else mode
+        first, last = self.slots[0]["t"], self.slots[-1]["t"]
+        if mode == 1:
+            return None, None, f"all data, {first:%H:%M}–{last:%H:%M}"
+        if mode == 2:
+            q = lambda w_: dt.datetime(w_.date().year(), w_.date().month(), w_.date().day(), w_.time().hour(), w_.time().minute(), tzinfo=LOCAL_TZ)
+            a, b = q(self.range_from.dateTime()), q(self.range_to.dateTime())
+            return a, b, f"custom, {a:%H:%M}–{b:%H:%M}"
+        w_ = runview.usable_window([s["t"] for s in self.slots], [s["par"] for s in self.slots])
+        if w_ is None:
+            return None, None, f"all data, {first:%H:%M}–{last:%H:%M} (no usable daylight found yet)"
+        a, b = w_
+        if (last - b).total_seconds() <= runview.USABLE_HOLD_S:       # still light at the end: keep the newest slots
+            b = last
+        return a, b, f"usable daylight, {a:%H:%M}–{b:%H:%M} (auto)"
+
+    def _in_window(self, items, key):
+        a, b, txt = self._time_window()
+        self.range_info.setText(f"Showing {txt}" if txt else "")
+        if self.range_mode.currentIndex() != 2 and self.slots:     # the from/to fields always show what is drawn
+            for w_, v in ((self.range_from, a or self.slots[0]["t"]), (self.range_to, b or self.slots[-1]["t"])):
+                w_.blockSignals(True)
+                w_.setDateTime(QtCore.QDateTime(QtCore.QDate(v.year, v.month, v.day), QtCore.QTime(v.hour, v.minute)))
+                w_.blockSignals(False)
+        if a is None:
+            return items, txt
+        return [x for x in items if a <= key(x) <= b], txt
 
     def _header(self):
         f = Q.QFrame(); f.setObjectName("strip"); outer = Q.QVBoxLayout(f); outer.setContentsMargins(16, 10, 16, 10); outer.setSpacing(8)
@@ -258,6 +391,8 @@ class Window(Q.QMainWindow):
         m = Q.QMenu(more)
         self.a_open_run = m.addAction("Open run folder", lambda: self.run_dir and os.startfile(self.run_dir))
         m.addAction("Resume an unfinished run…", self._resume_dialog)
+        m.addAction("Open a recorded run (read-only)…", self._open_recorded_run)
+        self.a_close_rec = m.addAction("Close the recorded run", self._close_recorded_run); self.a_close_rec.setEnabled(False)
         m.addSeparator()
         m.addAction("Open log folder", lambda: os.startfile(str(app_home() / "logs")))
         m.addAction("About LightKeeper", self._about)
@@ -381,7 +516,7 @@ class Window(Q.QMainWindow):
         self.lon.setToolTip("Longitude in degrees: east positive, WEST NEGATIVE (the Americas are negative)")
         self.site_lbl = Q.QLabel(""); self.site_lbl.setObjectName("secondary"); self.site_lbl.setWordWrap(True); f.addRow("", self.site_lbl)
         for w_ in (self.lat, self.lon):
-            w_.valueChanged.connect(lambda *_: self._show_site())
+            w_.valueChanged.connect(lambda *_: (self._show_site(), self._site_changed()))
         self._show_site()
         self.cb_logon = Q.QCheckBox("Resume after a Windows restart"); self.cb_logon.setChecked(True)
         self.cb_logon.setToolTip("At the next logon. A per-run entry in HKCU\\...\\Run, removed when the run closes or is interrupted on purpose.")
@@ -521,7 +656,10 @@ class Window(Q.QMainWindow):
 
     def _tab_schedule(self):
         w = Q.QWidget(); h = Q.QHBoxLayout(w); h.setContentsMargins(0, 6, 0, 0)
-        self.c_sch = Canvas(1, 1); h.addWidget(self.c_sch, 3)
+        left = Q.QVBoxLayout(); left.setContentsMargins(0, 0, 0, 0)
+        self.sch_notice = Q.QLabel("Updating the schedule for the new site…"); self.sch_notice.setStyleSheet(f"color: {ORANGE}; padding: 4px 0")
+        self.sch_notice.setVisible(False); left.addWidget(self.sch_notice)
+        self.c_sch = Canvas(1, 1); left.addWidget(self.c_sch, 1); h.addLayout(left, 3)
         self.sch_text = Q.QTextBrowser(); self.sch_text.setMinimumWidth(360); self.sch_text.setMaximumWidth(460)
         self.sch_text.setStyleSheet(f"QTextBrowser {{ background: {SURFACE}; border: none; padding: 10px; }}"); h.addWidget(self.sch_text, 1)
         self.tabs.addTab(w, "Schedule")
@@ -550,7 +688,12 @@ class Window(Q.QMainWindow):
         self.cal_text = Q.QPlainTextEdit(); self.cal_text.setReadOnly(True); self.cal_text.setStyleSheet("font-family: Consolas; font-size: 9pt;")
         l.addWidget(self.cal_text, 1)
         h.addWidget(p)
-        v = Q.QVBoxLayout(); self.c_cal = Canvas(2, 1, [2.2, 1], sharex=True); v.addWidget(plot_toolbar(self.c_cal, self)); v.addWidget(self.c_cal, 1); h.addLayout(v, 1)
+        v = Q.QVBoxLayout(); self.c_cal = Canvas(2, 1, [2.2, 1], sharex=True)
+        r = Q.QHBoxLayout(); r.addWidget(plot_toolbar(self.c_cal, self))
+        b = Q.QPushButton("Fit y"); b.setToolTip("Stretch the y-axes to the data in the visible wavelength range"); b.clicked.connect(self._cal_fit_y)
+        r.addWidget(b); hint = Q.QLabel("Wheel stretches y, Shift+wheel zooms x, Ctrl+wheel both; double-click resets"); hint.setObjectName("secondary")
+        r.addWidget(hint); r.addStretch(1); v.addLayout(r); v.addWidget(self.c_cal, 1); h.addLayout(v, 1)
+        self.c_cal.mpl_connect("scroll_event", self._on_scroll); self.c_cal.mpl_connect("button_press_event", self._on_click)
         self.c_cal.ax[0].set_title("Lamp spectrum, dark-subtracted, with NIST reference lines")
         self.c_cal.ax[1].set_title("Fit residual (NIST − fit)")
         self.tabs.addTab(w, "Calibration")
@@ -651,7 +794,6 @@ class Window(Q.QMainWindow):
             path = folder / f"{stem}.dpt"; k = 2
             while path.exists():
                 path = folder / f"{stem}_{k}.dpt"; k += 1
-            np.savetxt(path, np.c_[x, y], delimiter=",", fmt=["%.4f", "%.4f"])
             plan = self._plan()
             meta = dict(app=f"{APP_NAME} {VERSION}", file=path.name, columns=["wavelength_nm", "counts_per_s" if rate else "counts"],
                         scan_time_local=t.isoformat(), integration_ms=us / 1000, scans_averaged=1,
@@ -662,12 +804,28 @@ class Window(Q.QMainWindow):
                         geometry=plan.geometry, setup={k_: getattr(plan, k_) for k_ in SETUP_FIELDS},
                         site=dict(lat=plan.site_lat, lon=plan.site_lon),
                         raw_counts=[round(float(v), 2) for v in raw], dark_counts=[round(float(v), 2) for v in d] if sub else None)
+            hdr = [f"{APP_NAME} {VERSION} spectrum", f"scan {t:%Y-%m-%d %H:%M:%S %Z}, {us / 1000:g} ms, 1 scan",
+                   f"device {self.info.get('model', '')} {self.info.get('serial', '')}, electric dark "
+                   f"{self.info.get('electric_dark_correction')}, nonlinearity {self.info.get('nonlinearity_correction')}",
+                   f"{'dark-subtracted' if sub else 'raw (no dark subtracted)'}; {len(bridged)} hot/cold pixels bridged; "
+                   f"wavelength axis: {self.axis_label}",
+                   f"label: {meta['label']}; geometry: {plan.geometry}; notes: {plan.notes}",
+                   f"details: {path.with_suffix('.json').name}",
+                   f"columns: wavelength_nm, {'counts_per_s' if rate else 'counts'}"]
+            np.savetxt(path, np.c_[x, y], delimiter=",", fmt=["%.4f", "%.4f"], header="\n".join(hdr), comments="# ")
             path.with_suffix(".json").write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
         except Exception as e:
             Q.QMessageBox.warning(self, APP_NAME, f"Spectrum not saved: {e!r}"); return
         self._log(f"spectrum saved: {path} ({us / 1000:g} ms, {'dark-subtracted' if sub else 'raw'}"
                   f"{', ' + str(len(bridged)) + ' hot/cold pixels bridged' if bridged else ''})")
         self.statusBar().showMessage(f"Saved {path.name} in {folder}", 10000)
+
+    def _site_changed(self):
+        """A new site changes every sun time: say so, then redraw the schedule (it used to wait for the 30 s refresh)."""
+        if not hasattr(self, "sch_notice"):
+            return
+        self.sch_notice.setVisible(True); self.sch_text.setHtml(f"<p style='color:{ORANGE}'>Updating the schedule for the new site…</p>")
+        QtCore.QTimer.singleShot(40, lambda: (self._update_schedule(), self.sch_notice.setVisible(False)))
 
     def _show_site(self):
         lat, lon = self.lat.value(), self.lon.value(); bad = site_problem(lat, lon)
@@ -887,6 +1045,8 @@ class Window(Q.QMainWindow):
                 self.hot = {k: v for k, v in e.items() if k != "type"}; self._update_mask(); self._draw_live(force=True)
                 self.m["darks"].setText(str(int(self.m["darks"].text()) + 1 if self.m["darks"].text().isdigit() else 1))
             elif t == "run":
+                if self.viewing is not None:
+                    self._close_recorded_run()
                 self.run_dir = e["dir"]; self.run_lbl.setText(Path(e["dir"]).name); self.run_lbl.setToolTip(e["dir"]); self.m["darks"].setText("0")
                 self.a_open_run.setEnabled(True)
                 self.run_times = (dt.datetime.fromisoformat(e["t_start"]), dt.datetime.fromisoformat(e["t_stop"]))
@@ -928,6 +1088,7 @@ class Window(Q.QMainWindow):
         return False
 
     def _apply_snapshot(self, snap):
+        self.viewing = None; self.a_close_rec.setEnabled(False)
         self.slots.clear(); self.spectra.clear(); self.spec_stride = 1; self._slot_count = 0
         if snap.get("device"):
             self._handle(dict(type="device", **snap["device"]))
@@ -1181,7 +1342,7 @@ class Window(Q.QMainWindow):
         """Fit the y-axis to the plotted spectra (the saturation line is ignored), optionally within an x range."""
         ys = []
         for ln in ax.get_lines():
-            if ln is self.l_sat or not ln.get_visible():
+            if ln is self.l_sat or ln.get_gid() == "sat" or not ln.get_visible():
                 continue
             xd = np.asarray(ln.get_xdata(), float); yd = np.asarray(ln.get_ydata(), float)
             if yd.size == 0 or xd.size != yd.size:
@@ -1206,8 +1367,9 @@ class Window(Q.QMainWindow):
 
     def _on_scroll(self, ev):
         ax = ev.inaxes
-        if ax not in self.c_spec.ax or ev.xdata is None or ev.ydata is None:
+        if ev.xdata is None or ev.ydata is None or not (ax in self.c_spec.ax or ax in self.c_cal.ax):
             return
+        canvas = self.c_spec if ax in self.c_spec.ax else self.c_cal
         f = 1 / 1.25 if ev.button == "up" else 1.25
         mods = set(getattr(ev, "modifiers", None) or ()) | ({ev.key} if ev.key else set())
         do_x = bool(mods & {"shift", "ctrl", "control"}); do_y = not (mods & {"shift"}) or bool(mods & {"ctrl", "control"})
@@ -1224,9 +1386,13 @@ class Window(Q.QMainWindow):
                 self._a1_ylim = ax.get_ylim()
         if do_x:
             zoom(ax.get_xlim, ax.set_xlim, ev.xdata, False)
-        self._manual_view(); self.c_spec.draw_idle()
+        if canvas is self.c_spec:
+            self._manual_view()
+        canvas.draw_idle()
 
     def _on_click(self, ev):
+        if ev.dblclick and ev.inaxes in self.c_cal.ax:
+            self._draw_cal(); return
         if ev.dblclick and ev.inaxes in self.c_spec.ax:
             self._a1_ylim = None
             if self.cb_auto.isChecked():
@@ -1240,6 +1406,10 @@ class Window(Q.QMainWindow):
             self._manual_view()
             self._a1_ylim = self.c_spec.ax[1].get_ylim()
 
+    def _cal_fit_y(self):
+        a0, a1 = self.c_cal.ax; xl = a0.get_xlim()
+        self._fit_y(a0, xl); self._fit_y(a1, xl); self.c_cal.draw_idle()
+
     def _fit_y_now(self):
         a0, a1 = self.c_spec.ax; xl = a0.get_xlim()
         self._fit_y(a0, xl); self._fit_y(a1, xl); self._a1_ylim = a1.get_ylim()
@@ -1248,12 +1418,15 @@ class Window(Q.QMainWindow):
     def _draw_timeseries(self):
         if not self.slots:
             return
-        S = self.slots[::max(1, len(self.slots) // 6000)]
+        shown, rtxt = self._in_window(self.slots, lambda s: s["t"])
+        if not shown:
+            return
+        S = shown[::max(1, len(shown) // 6000)]
         t = [s["t"] for s in S]
         for a in self.c_ts.ax:
             a.cla(); style_ax(a)
         a = self.c_ts.ax
-        a[0].plot(t, [s["par"] for s in S], color=GOLD, lw=0.8); a[0].set_yscale("log"); a[0].set_title("420–700 nm rate (counts/s, instrument-relative)", loc="left", fontsize=9)
+        a[0].plot(t, [s["par"] for s in S], color=GOLD, lw=0.8); a[0].set_yscale("log"); a[0].set_title(f"420–700 nm rate (counts/s, instrument-relative) · {rtxt}", loc="left", fontsize=9)
         a[1].plot(t, [s["rfr"] for s in S], color=RED, lw=0.8); a[1].set_title("R:FR counts (655–665 / 725–735)", loc="left", fontsize=9)
         a[2].plot(t, [s["nirred"] for s in S], color=TEAL, lw=0.8); a[2].set_title("NIR/red (780–820 / 665–680)", loc="left", fontsize=9)
         a[3].plot(t, [s["o2a"] for s in S], color=BLUE, lw=0.8); a[3].set_title("O₂-A apparent depth (760 nm; shoulders 754–756 / 770–772)", loc="left", fontsize=9)
@@ -1271,8 +1444,11 @@ class Window(Q.QMainWindow):
     def _draw_waterfall(self):
         if len(self.spectra) < 2 or self.axis is None:
             return
+        shown, rtxt = self._in_window(self.spectra, lambda sp: sp[0])
+        if len(shown) < 2:
+            return
         a = self.c_wf.ax[0]; a.cla(); style_ax(a)
-        R = np.array([r for _, r in self.spectra], float); t = [s for s, _ in self.spectra]
+        R = np.array([r for _, r in shown], float); t = [s for s, _ in shown]
         if self.cb_mask.isChecked() and self.valid is not None:
             R = hotpix.fill(R, self.valid)
         x = self.axis; m = (x > 380) & (x < 1050)
@@ -1289,7 +1465,7 @@ class Window(Q.QMainWindow):
         tn = mdates.date2num(t)
         im = a.imshow(Z, aspect="auto", origin="lower", extent=[x[m][0], x[m][-1], tn[0], tn[-1]], cmap="magma", vmin=lo, vmax=hi, interpolation="nearest")
         a.yaxis_date(tz=LOCAL_TZ); a.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=LOCAL_TZ))
-        a.set_xlabel(f"wavelength (nm, {self.axis_label})"); a.set_title(f"Recorded spectra over time ({len(self.spectra)} shown, every {self.spec_stride} slot(s))", loc="left")
+        a.set_xlabel(f"wavelength (nm, {self.axis_label})"); a.set_title(f"Recorded spectra over time ({len(shown)} shown, every {self.spec_stride} slot(s)) · {rtxt}", loc="left")
         if self.wf_cbar is not None:
             try:
                 self.wf_cbar.remove()
@@ -1448,7 +1624,7 @@ class Window(Q.QMainWindow):
                 if self.valid is not None:
                     y = hotpix.fill(y, self.valid)
             a0.plot(x, y, color=TEAL, lw=0.7)
-            a0.axhline(SAT_LEVEL, color=RED, ls="--", lw=0.6)
+            a0.axhline(SAT_LEVEL, color=RED, ls="--", lw=0.6, gid="sat")
             refs = reference_lines(self.lamp_combo.currentText(), float(x[5]), float(x[-5]), self.cal_minrel.value(), self.cal_iso.value())
             top = float(np.nanmax(y)) if np.isfinite(y).any() else 1
             for r in refs:

@@ -1,4 +1,4 @@
-"""GUI check (0.3.6): Save spectrum writes the displayed scan as a two-column .dpt plus a .json with the details, named
+"""GUI check (0.3.6, header 0.3.7): Save spectrum writes the displayed scan as a two-column .dpt (with # detail lines) plus a .json, named
 from the run label or the scan time. Off-screen, simulator only, temporary LIGHTKEEPER_HOME. Run:
    set QT_QPA_PLATFORM=offscreen & python -X utf8 tests\\gui_save_spectrum.py"""
 import json
@@ -50,13 +50,15 @@ check("the run label names the file", any(f.name.startswith("Hg_Ar_lamp_") for f
 check("the scan time names the file when there is no label", any(f.name[:4].isdigit() for f in files))
 check("a second save in the same second gets _2", any(f.stem.endswith("_2") for f in files))
 f = next(f for f in files if f.name.startswith("Hg_Ar"))
-rows = [line.split(",") for line in f.read_text().splitlines()]
+lines = f.read_text(encoding="utf-8").splitlines()
+check("the .dpt starts with # detail lines", lines[0].startswith("# LightKeeper") and any(l.startswith("# scan ") for l in lines))
+rows = [line.split(",") for line in lines if not line.startswith("#")]
 check("only two numeric columns, one row per pixel", len(rows) == 2068 and all(len(r) == 2 for r in rows)
       and np.isfinite(np.array(rows, float)).all())
 m = json.loads(f.with_suffix(".json").read_text())
 check("the .json holds the details", m["integration_ms"] == 100 and m["dark_subtracted"] and m["device"]["serial"] == "SIM0001"
       and m["hot_cold_pixels_bridged"] == SIM_HOT and len(m["raw_counts"]) == 2068)
-y = np.loadtxt(f, delimiter=",")[:, 1]
+y = np.loadtxt(f, delimiter=",", comments="#")[:, 1]
 check("hot pixels are bridged in the saved spectrum", max(abs(y[i] - (y[i - 1] + y[i + 1]) / 2) for i in SIM_HOT) < 300)
 w.engine.send("quit"); pump(1)
 print(f"\n{sum(results)}/{len(results)} checks passed; temp {HOME}")

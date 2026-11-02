@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.7 (2026-11-01)
+- **Time range for the Waterfall and Time series tabs.** A bar above these tabs chooses **Usable daylight (auto)**,
+  **All data** or **Custom** (from/to), and quotes the range drawn. Usable daylight starts and ends where the
+  420–700 nm dark-corrected signal stays above 1 % of the day's bright level for 5 minutes, so the pre-dawn and
+  after-dusk dark noise no longer swamps the waterfall and the ratios. On the 1 Nov 2026 forest-edge run this is
+  07:38–17:29. During a live run the newest slots stay in view. **Reset** returns to the automatic range.
+- **Open a recorded run (read-only).** **Open recorded run…** (on the range bar, or More) reads a run's HDF5 files
+  in the background, dark-corrects them with the run's pre-run dark set, and shows them in the Waterfall and Time
+  series tabs from the usable part of the day. The files are opened read-only; nothing in the run folder changes.
+  It is refused while a run is being recorded or watched, and a run that starts replaces it on screen. **More →
+  Close the recorded run** clears it.
+- **Calibration plot scaling.** **Fit y** stretches both calibration plots to the data in the visible wavelength
+  range (ignoring the 60,000-count line). The mouse wheel zooms as on the Spectrum tab, and a double-click resets.
+- **Site changes update the Schedule at once.** Changing the latitude or longitude used to wait for the 30 s
+  refresh. The Schedule now says "Updating the schedule for the new site…" and redraws straight away.
+- **Details inside the .dpt.** OPUS reads `#` header lines, so each saved spectrum now starts with the main details
+  (scan time, integration, device, processing, label, geometry, notes). The data rows are unchanged, and the `.json`
+  still holds everything, including the raw and dark counts.
+
 ## 0.3.6 (2026-11-01)
 - **Save spectrum (Ctrl+S).** Saves the scan on screen, processed as displayed (dark subtraction, hidden pixels
   bridged, counts or counts/s, display axis), to `<Save in>\..\spectra\<label>_<YYYY-MM-DD_HH-MM-SS>.dpt`. With no
