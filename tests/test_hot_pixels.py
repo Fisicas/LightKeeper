@@ -54,7 +54,7 @@ class TestRunAndReconnect(unittest.TestCase):
                 wait_for(eng, lambda e: e["type"] == "state" and e["state"] == "IDLE", 10, ev)
                 self.assertFalse([e for e in ev if e["type"] == "hot_pixels"])        # nothing saved yet
                 now = dt.datetime.now(LOCAL_TZ)
-                plan = RunPlan(label="hot pixels", out_dir=td, start_now=True, stop_local=(now + dt.timedelta(seconds=6)).isoformat(),
+                plan = RunPlan(auto_exposure=True, label="hot pixels", out_dir=td, start_now=True, stop_local=(now + dt.timedelta(seconds=6)).isoformat(),
                                ladder_ms=[50, 100, 200], min_int_ms=50, max_int_ms=200, int_ms=100, dark_s_per_int=0.2,
                                burst_every_min=0, flush_s=2, rotate_min=60)
                 eng.send("start", plan.to_dict())

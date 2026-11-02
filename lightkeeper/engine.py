@@ -35,10 +35,10 @@ import h5py
 import numpy as np
 
 from . import VERSION
-from . import clock, hotpix
+from . import clock, hotpix, runview
 from .devices import SIM_ID, OceanDevice, SimDevice, open_by_serial
 from .procs import read_json, write_json_atomic
-from .schedule import SETUP_FIELDS, RunPlan, burst_times, dark_scan_count, ladder_us, sun_events
+from .schedule import SETUP_FIELDS, RunPlan, burst_times, burst_us, dark_ladder_us, dark_scan_count, ladder_us, sun_events
 from .storage import LOCAL_TZ, Events, Writer, iso_local, local_dt, mono_ns, now_local, unique_dir, wall_ns
 
 SAT_LEVEL = 60000.0
@@ -372,8 +372,12 @@ class Engine(threading.Thread):
         self.dev.set_corrections(plan.edc, plan.nlc)
         info = self.dev.info()
         lad = ladder_us(plan, self.dev.min_us, self.dev.max_us)
+        dl = dark_ladder_us(plan, self.dev.min_us, self.dev.max_us)
+        temp_src = getattr(self.dev, "temperature_source", "")
         meta = dict(app=f"LightKeeper {VERSION}", python=sys.version, platform=platform.platform(), numpy=np.__version__,
-                    h5py=h5py.__version__, plan=plan.to_dict(), device=info, ladder_us=lad,
+                    h5py=h5py.__version__, plan=plan.to_dict(), device=info, ladder_us=lad, dark_ladder_us=dl,
+                    burst_int_us=burst_us(plan, self.dev.min_us, self.dev.max_us),
+                    temperature_source=temp_src or "none (no readable sensor on this device)",
                     planned_start_local=t_start.isoformat(), planned_stop_local=t_stop.isoformat(),
                     sun_events_local={k: (v.isoformat() if v else None) for k, v in sun_events(
                         t_start.date(), plan.site_lat, plan.site_lon).items()},
@@ -397,9 +401,9 @@ class Engine(threading.Thread):
                      **{k: getattr(plan, k) for k in SETUP_FIELDS})
         self.ctx = dict(plan=plan, dir=run_dir, meta=meta, events=Events(run_dir / "events.csv"),
                         writer=Writer(run_dir, self.dev.wavelengths, attrs, plan.rotate_min, plan.flush_s),
-                        t_start=t_start, t_stop=t_stop, ladder=lad, used_us=set(), n_slots=0, n_sat=0, burst_id=0,
+                        t_start=t_start, t_stop=t_stop, ladder=lad, dark_ladder=dl, used_us=set(), n_slots=0, n_sat=0, burst_id=0,
                         dark_session=0, bursts=burst_times(plan, t_start, t_stop), stop_req=False,
-                        segment=0, dark_sets=[], pre_done=False, last_slot_ns=None, uncovered=False)
+                        segment=0, dark_sets=[], pre_done=False, last_slot_ns=None, uncovered=False, temp=bool(temp_src))
         self.auto = plan.auto_exposure
         self.emit("run", dir=str(run_dir), plan=plan.to_dict(), ladder_us=lad, t_start=t_start.isoformat(), t_stop=t_stop.isoformat())
         self.log("run_created", f"{run_dir}")
@@ -439,6 +443,8 @@ class Engine(threading.Thread):
     def _c_post_dark(self):
         if self.ctx is None or self.state != "POST_RUN":
             return
+        if self.ctx.get("post_wait_ns"):
+            self.ctx["meta"]["post_darks_delay_min"] = round((wall_ns() - self.ctx["post_wait_ns"]) / 6e10, 1)
         self._dark_set("post")
         self._finalize("post-run darks recorded")
 
@@ -543,6 +549,8 @@ class Engine(threading.Thread):
         gap_s = (wall_ns() - int(last)) / 1e9 if last else None
         self.ctx = dict(plan=plan, dir=run_dir, meta=meta, events=Events(run_dir / "events.csv"), writer=w,
                         t_start=t_start, t_stop=t_stop, ladder=lad, used_us=set(st.get("used_us", [])),
+                        dark_ladder=[int(u) for u in meta.get("dark_ladder_us", lad)],
+                        temp=bool(getattr(self.dev, "temperature_source", "")) and "none" not in str(meta.get("temperature_source", "none")),
                         n_slots=int(st.get("n_slots", 0)), n_sat=int(st.get("n_sat", 0)), burst_id=int(st.get("burst_id", 0)),
                         dark_session=int(st.get("dark_session", 0)), bursts=[b for b in burst_times(plan, t_start, t_stop) if b > now],
                         stop_req=False, segment=seg, dark_sets=list(st.get("dark_sets", [])), pre_done=bool(st.get("pre_done")),
@@ -591,7 +599,7 @@ class Engine(threading.Thread):
         c = self.ctx; c["dark_session"] += 1; sid = c["dark_session"]
         c["dark_sets"].append(dict(session=sid, label=label, complete=False, start_local=iso_local(wall_ns())))
         restore = self.dev.int_us
-        lad = c["ladder"]
+        lad = c.get("dark_ladder") or c["ladder"]
         self.set_state("DARK", f"{label}-run darks: {len(lad)} integration times")
         self.log("dark_start", f"session {sid} ({label}); {len(lad)} integration times {[u / 1000 for u in lad]} ms")
         if self.dev.simulated:
@@ -687,9 +695,13 @@ class Engine(threading.Thread):
                    overrun_ms=np.float32(max(0, mono_ns() - s1) / 1e6), mean=mean.astype(np.float32))
         if p.store_sd:
             row["sd"] = sd.astype(np.float32)
+        temp = None
+        if c.get("temp"):
+            temp = self.dev.temperature_c()
+            row["temperature_c"] = np.float32(np.nan if temp is None else temp)
         w.add("blocks", row)
         c["n_slots"] += 1; c["n_sat"] += int(nsat > 0); c["last_slot_ns"] = int(row["t_wall_ns"])
-        self.emit("slot", t_ns=int(row["t_wall_ns"]), int_us=us, n=n, bmax=bmax, p995=p995, nsat=nsat,
+        self.emit("slot", t_ns=int(row["t_wall_ns"]), int_us=us, n=n, bmax=bmax, p995=p995, nsat=nsat, temp_c=temp,
                   mean=mean.astype(np.float32), n_slots=c["n_slots"], n_sat_slots=c["n_sat"], size_mb=w.size_mb(),
                   next_burst=c["bursts"][0].isoformat() if c["bursts"] else "")
         if self.auto:
@@ -706,8 +718,7 @@ class Engine(threading.Thread):
     def _burst(self):
         c = self.ctx; p = c["plan"]; w = c["writer"]; c["burst_id"] += 1; bid = c["burst_id"]
         restore = self.dev.int_us
-        us = max(self.dev.min_us, min(restore, int(p.burst_max_int_ms * 1000)))
-        us = max([v for v in c["ladder"] if v <= us] or [c["ladder"][0]])
+        us = min(restore, burst_us(p, self.dev.min_us, self.dev.max_us))     # 0.3.8: never snapped onto the slot ladder
         if c.get("last_p995") is not None:
             pred = c["last_p995"] * us / c["last_p995_us"]
             if pred < BURST_MIN_FILL * SAT_LEVEL:
@@ -728,6 +739,8 @@ class Engine(threading.Thread):
             self._drain()
         w.maybe_flush(force=True)
         self.log("burst_end", f"#{bid}, {n} scans ({n / p.burst_s:.1f} per s)")
+        c["meta"].setdefault("bursts_done", []).append(dict(id=bid, local=iso_local(wall_ns()), int_ms=us / 1000, scans=n,
+                                                             scans_per_s=round(n / p.burst_s, 2)))
         self._save_state()
         self._set_int(restore, "after burst", log=False)
         c["k"] = int((mono_ns() - c["m0"]) // c["slot_ns"]) + 1
@@ -773,6 +786,7 @@ class Engine(threading.Thread):
                          n_bursts=c["burst_id"], integration_times_used_ms=sorted(u / 1000 for u in c["used_us"]))
         (c["dir"] / "run_metadata.json").write_text(json.dumps(c["meta"], indent=1, default=str))
         if c["plan"].post_darks:
+            c["post_wait_ns"] = wall_ns()
             self.set_state("POST_RUN", "cover the input and record post-run darks (or skip)")
             self.emit("need_post_dark")
         else:
@@ -786,6 +800,14 @@ class Engine(threading.Thread):
         c["meta"].update(final_local=iso_local(wall_ns()), finalize_reason=why, files=c["writer"].files,
                          rows=c["writer"].rows, dark_sessions=c["dark_session"])
         (c["dir"] / "run_metadata.json").write_text(json.dumps(c["meta"], indent=1, default=str))
+        try:                                     # one file that answers "was this a good run?"; never fatal
+            summ = runview.summarize(c["dir"], c["meta"])
+            write_json_atomic(c["dir"] / "run_summary.json", summ)
+            self.log("run_summary", f"usable {summ.get('usable_light', {}).get('first_local', '-')} to "
+                                    f"{summ.get('usable_light', {}).get('last_local', '-')}, {summ['slots']['recorded']} slots, "
+                                    f"{len(summ['integration_changes'])} integration changes")
+        except Exception as e:
+            self.log("run_summary_failed", repr(e))
         self.log("run_closed", why)
         self._save_state(status="closed")
         self.emit("run_closed", dir=str(c["dir"]), rows=c["writer"].rows)

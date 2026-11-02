@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.8 (2026-11-02)
+- **Fixed exposure by default.** A run records at a fixed 500 ms unless **Exposure** is set to **Automatic** (which
+  moves along the ladder within the **Auto range**, unchanged for now). The run's exposure is now its own setting:
+  - **Fix:** since 0.3.5, a run took its exposure from the Live view controls, which open at Fixed 100 ms, so a run
+    started from a fresh window would have recorded at 100 ms.
+- **Fix: bursts at their own integration time (B1).** A 50 ms burst was snapped onto the slot ladder (500–3000 ms),
+  so every burst on 1 Nov ran at 500 ms, 2 scans/s. Bursts now run at the **Burst … at** time (never longer than the
+  slot time in use), and that time gets its own dark.
+- **Darks at two times under fixed exposure (B5).** A fixed run takes darks at the fixed time, the burst time and
+  **Long dark (fixed)** (default 3000 ms, advanced settings), so the dark-drift model has the dark current at two
+  integration times. Automatic runs keep their whole ladder plus the burst time.
+- **Temperature logging.** At connect, LightKeeper records which SDK features the spectrometer reports
+  (`features_supported`), its nonlinearity coefficients and its temperature source in the device information,
+  the Log and `run_metadata.json`.
+  - **Devices with a readable sensor:** every slot gets `blocks/temperature_c`, shown as **Detector, °C**. The
+    OceanDirect SDK reads temperature only through a thermo-electric cooler's thermistor.
+  - **The Maya2000 Pro:** it is uncooled, and the SDK release notes say its temperature feature was removed, so no
+    temperature is logged and `temperature_source` says so. The simulator drifts slowly, for testing.
+- **Pre-flight checks at Start.** The Start dialog lists, as ✔ / ⚠ / ✖:
+  - exposure mode;
+  - burst time and its dark;
+  - dark times (one only is flagged);
+  - site and time zone;
+  - empty setup fields and no photo;
+  - clock offset (one SNTP query);
+  - disk space against the estimate;
+  - electric dark / nonlinearity changed since the last run;
+  - a diffuser that differs from the last run with the same label;
+  - temperature logging.
+
+  The list is written to the Log.
+- **Post-run dark reminder repeats.** The tray reminds you (with a beep) every 15 min until the post-run darks are
+  taken or skipped, and `post_darks_delay_min` records how long it took.
+- **`run_summary.json` at close.** It records:
+  - slots and saturated slots;
+  - each integration change with its time;
+  - bursts with their integration and realised scan rate;
+  - dark times and pre/post dark agreement;
+  - usable light (the 1 % rule, and > 100 counts/s), with the sun elevation at each end;
+  - the clock-offset range;
+  - the temperature range;
+  - the version.
+
 ## 0.3.7 (2026-11-01)
 - **Time range for the Waterfall and Time series tabs.** A bar above these tabs chooses **Usable daylight (auto)**,
   **All data** or **Custom** (from/to), and quotes the range drawn. Usable daylight starts and ends where the

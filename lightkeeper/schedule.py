@@ -43,8 +43,8 @@ class RunPlan:
     stop_event: str = ""             # sun event name -> stop at that event on the start day (or the next one) + stop_offset_min
     stop_offset_min: float = 0.0
     slot_s: float = 1.0
-    auto_exposure: bool = True
-    int_ms: float = 500.0            # initial (auto) or fixed integration time
+    auto_exposure: bool = False      # 0.3.8: fixed exposure by default; automatic moves along the ladder in min..max
+    int_ms: float = 500.0            # fixed integration time, or the starting time under automatic exposure
     min_int_ms: float = 500.0
     max_int_ms: float = 3000.0
     ladder_ms: list = dc.field(default_factory=lambda: list(DEFAULT_LADDER_MS))
@@ -54,7 +54,8 @@ class RunPlan:
     burst_every_min: float = 60.0    # 0 = no bursts
     burst_offset_min: float = 30.0
     burst_s: float = 120.0
-    burst_max_int_ms: float = 50.0
+    burst_max_int_ms: float = 50.0   # 0.3.8: the burst's own integration time (never snapped onto the slot ladder)
+    long_dark_ms: float = 3000.0     # 0.3.8: fixed exposure also takes darks here, so the dark model has two times
     dark_s_per_int: float = 5.0
     pre_darks: bool = True
     post_darks: bool = True
@@ -111,12 +112,33 @@ def _aware(s: str) -> dt.datetime:
     return t if t.tzinfo else t.replace(tzinfo=LOCAL_TZ)
 
 
+def _clamp_us(ms: float, dev_min_us: int, dev_max_us: int) -> int:
+    return int(min(dev_max_us, max(dev_min_us, round(ms * 1000))))
+
+
 def ladder_us(plan: RunPlan, dev_min_us: int, dev_max_us: int) -> list[int]:
+    """Integration times the recording may use: the ladder within min..max (automatic), or the one fixed time."""
+    if not plan.auto_exposure:
+        return [_clamp_us(plan.int_ms, dev_min_us, dev_max_us)]
     lo = max(dev_min_us, int(plan.min_int_ms * 1000)); hi = min(dev_max_us, int(plan.max_int_ms * 1000))
     vals = sorted({int(round(x * 1000)) for x in plan.ladder_ms if lo <= x * 1000 <= hi})
-    if not plan.auto_exposure:
-        vals = sorted(set(vals) | {int(round(plan.int_ms * 1000))})
     return vals or [lo]
+
+
+def burst_us(plan: RunPlan, dev_min_us: int, dev_max_us: int) -> int:
+    """The burst's own integration time (0.3.8: not snapped onto the slot ladder; that turned 50 ms into 500 ms)."""
+    return _clamp_us(plan.burst_max_int_ms, dev_min_us, dev_max_us)
+
+
+def dark_ladder_us(plan: RunPlan, dev_min_us: int, dev_max_us: int) -> list[int]:
+    """Every integration time that gets a dark: the recording ladder, the burst time, and under fixed exposure a second,
+    long time (the dark-drift model needs the dark current at two integration times)."""
+    vals = set(ladder_us(plan, dev_min_us, dev_max_us))
+    if plan.burst_every_min > 0:
+        vals.add(min(burst_us(plan, dev_min_us, dev_max_us), max(vals)))
+    if not plan.auto_exposure and plan.long_dark_ms > 0:
+        vals.add(_clamp_us(plan.long_dark_ms, dev_min_us, dev_max_us))
+    return sorted(vals)
 
 
 def dark_scan_count(int_us: int, dark_s: float) -> int:
@@ -226,20 +248,21 @@ def estimates(plan: RunPlan, n_pixels: int, dev_min_us: int, dev_max_us: int,
     t1 = plan.stop_dt() if t1 is None else t1
     dur = max(0.0, t1.timestamp() - t0.timestamp())   # real elapsed time; same-zone subtraction ignores a DST change
     lad = ladder_us(plan, dev_min_us, dev_max_us)
+    dl = dark_ladder_us(plan, dev_min_us, dev_max_us)
     bursts = burst_times(plan, t0, t1)
-    b_int = max(dev_min_us, min(lad[-1], int(plan.burst_max_int_ms * 1000)))
-    b_int = max([u for u in lad if u <= b_int] or [lad[0]])
+    b_int = min(burst_us(plan, dev_min_us, dev_max_us), lad[-1])
     per_spec = n_pixels * 4
     slots = dur / plan.slot_s
     slot_bytes = slots * per_spec * (2 if plan.store_sd else 1)
     burst_scans = len(bursts) * plan.burst_s * 1e6 / b_int
-    dark_scans = sum(dark_scan_count(u, plan.dark_s_per_int) for u in lad) * (int(plan.pre_darks) + int(plan.post_darks))
+    dark_scans = sum(dark_scan_count(u, plan.dark_s_per_int) for u in dl) * (int(plan.pre_darks) + int(plan.post_darks))
     total = slot_bytes + (burst_scans + dark_scans) * per_spec
     try:
         free = shutil.disk_usage(Path(plan.out_dir) if Path(plan.out_dir).exists() else Path(plan.out_dir).anchor).free
     except Exception:
         free = float("nan")
     return dict(start=t0, stop=t1, duration_h=dur / 3600, slots=int(slots), ladder_ms=[u / 1000 for u in lad],
+                dark_ladder_ms=[u / 1000 for u in dl], data_bytes=total,
                 bursts=bursts, burst_int_ms=b_int / 1000, burst_scans=int(burst_scans),
-                dark_session_s=dark_session_seconds(lad, plan.dark_s_per_int), dark_scans_total=int(dark_scans),
+                dark_session_s=dark_session_seconds(dl, plan.dark_s_per_int), dark_scans_total=int(dark_scans),
                 data_gb_uncompressed=total / 1e9, disk_free_gb=free / 1e9)

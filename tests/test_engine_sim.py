@@ -40,7 +40,7 @@ class TestEngine(unittest.TestCase):
             eng.send("connect", SIM_ID, True, True)
             wait_for(eng, lambda e: e["type"] == "state" and e["state"] == "IDLE", 10, ev)
             now = dt.datetime.now(LOCAL_TZ)
-            plan = RunPlan(label="unit test", out_dir=td, start_now=True, stop_local=(now + dt.timedelta(seconds=22)).isoformat(),
+            plan = RunPlan(auto_exposure=True, label="unit test", out_dir=td, start_now=True, stop_local=(now + dt.timedelta(seconds=22)).isoformat(),
                            ladder_ms=[8, 10, 20, 50, 100, 200], min_int_ms=8, max_int_ms=200, int_ms=100, dark_s_per_int=0.2,
                            burst_every_min=1, burst_offset_min=(now.minute + 1) % 60 if now.second > 45 else now.minute + 0, burst_s=3,
                            flush_s=5, rotate_min=1)
@@ -108,7 +108,7 @@ class TestCalibration(unittest.TestCase):
 class TestPlan(unittest.TestCase):
     def test_estimates(self):
         now = dt.datetime.now(LOCAL_TZ)
-        p = RunPlan(stop_local=(now + dt.timedelta(hours=10)).isoformat())
+        p = RunPlan(auto_exposure=True, stop_local=(now + dt.timedelta(hours=10)).isoformat())
         e = estimates(p, 2068, 8000, 65_000_000)
         self.assertEqual(len(e["bursts"]), 10)
         self.assertTrue(60 < e["dark_session_s"] < 130)
@@ -123,7 +123,7 @@ class TestResumeAfterStop(unittest.TestCase):
             eng.send("connect", SIM_ID, True, True)
             wait_for(eng, lambda e: e["type"] == "state" and e["state"] == "IDLE", 10, ev)
             now = dt.datetime.now(LOCAL_TZ)
-            plan = RunPlan(label="resume after stop", out_dir=td, start_now=True, stop_local=(now + dt.timedelta(seconds=14)).isoformat(),
+            plan = RunPlan(auto_exposure=True, label="resume after stop", out_dir=td, start_now=True, stop_local=(now + dt.timedelta(seconds=14)).isoformat(),
                            ladder_ms=[8, 20, 100], min_int_ms=8, max_int_ms=100, int_ms=100, dark_s_per_int=0.2, burst_every_min=0, flush_s=1)
             eng.send("start", plan.to_dict())
             run = Path(wait_for(eng, lambda e: e["type"] == "run", 20, ev)["dir"])
@@ -183,7 +183,7 @@ class TestReconnectRace(unittest.TestCase):
             eng.send("connect", SIM_ID, True, True)
             wait_for(eng, lambda e: e["type"] == "state" and e["state"] == "IDLE", 10, ev)
             now = dt.datetime.now(LOCAL_TZ)
-            plan = RunPlan(label="race", out_dir=td, start_now=False, start_local=(now + dt.timedelta(hours=3)).isoformat(),
+            plan = RunPlan(auto_exposure=True, label="race", out_dir=td, start_now=False, start_local=(now + dt.timedelta(hours=3)).isoformat(),
                            stop_local=(now + dt.timedelta(hours=4)).isoformat(), ladder_ms=[8, 20], min_int_ms=8,
                            max_int_ms=20, int_ms=20, dark_s_per_int=0.1, burst_every_min=0)
             eng.send("start", plan.to_dict())

@@ -41,6 +41,7 @@ from .schedule import RunPlan
 from .storage import LOCAL_TZ
 
 HISTORY_RECENT = 900          # slot events kept in full for a window that attaches (last ~15 min at 1 s slots)
+POST_DARK_REMIND_S = 900     # repeat the post-run dark reminder every 15 min until the darks are taken or skipped
 HISTORY_SPARSE = 2400         # older slots kept every N-th (N doubles as needed) so a late window still sees the day
 LABELS = {"RECORDING": "recording", "BURST": "fast burst", "STANDBY": "armed, waiting for the start time",
           "DARK": "dark set (input covered)", "AWAIT_UNCOVER": "waiting: uncover the input, then Continue",
@@ -286,6 +287,14 @@ class Recorder(QtCore.QObject):
             self._try_connect()
         if self.state in ("RECORDING", "BURST", "STANDBY"):
             self._refresh_tray()
+        since = getattr(self, "_post_since", None)
+        if self.state == "POST_RUN" and since and time.time() - self._post_last >= POST_DARK_REMIND_S:
+            self._post_last = time.time()
+            self._note("Post-run darks still needed", f"The run ended {(time.time() - since) / 60:.0f} min ago. Cover the input, "
+                       "then choose 'Record post-run darks…' in this icon's menu.", "warning", force=True)
+            Q.QApplication.beep()
+        elif self.state != "POST_RUN":
+            self._post_since = None
 
     # ---------------------------------------------------------------- snapshot for a window that attaches
     def _snapshot(self):
@@ -383,6 +392,7 @@ class Recorder(QtCore.QObject):
                                     "You can close the LightKeeper window; this icon keeps the run.")
             return True
         if t == "need_post_dark":
+            self._post_since = self._post_last = time.time()
             self._note("Run finished - post-run darks", "Cover the input, then choose 'Record post-run darks…' in this icon's menu "
                                                          "or in the LightKeeper window.", "warning", force=True)
             return True

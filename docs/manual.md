@@ -66,15 +66,19 @@ setup panel can never change a value.
 1. Connect, start the live view, aim the fiber, and check the exposure.
 2. Fill in the run plan and check the Schedule tab.
 3. Press **Start run…** and confirm the summary.
-4. Cover the input. The **pre-run dark set** records every ladder integration time (about a minute for each set with the default ladder).
+4. Cover the input. The **pre-run dark set** records every integration time the run can use: the fixed time (or the
+   automatic ladder), the burst time and the **Long dark (fixed)** time (default 3000 ms). The Start dialog lists them
+   with the pre-flight checks.
 5. Uncover the input when asked, without moving the fiber, and press Continue.
    - **Start mode "Now":** recording starts at once.
    - **Start mode "At a set time":** the banner shows STANDBY until the start time.
 6. **Recording.** Each slot (default 1 s) stores the per-pixel mean and SD of the n raw scans in that slot.
-   - **Exposure:** integration time steps along the ladder automatically, never below the minimum you set (default 500 ms)
-     and never below 8 ms on a Maya2000 Pro.
-   - **Bursts:** at the scheduled times, every scan is stored at ≤ 50 ms by default. A burst predicted to fill < 1 % of
-     full scale is skipped and logged.
+   - **Exposure:** fixed at the **Exposure** time (default 500 ms). With **Automatic**, the integration time steps along
+     the ladder within the **Auto range**, never below 8 ms on a Maya2000 Pro.
+   - **Bursts:** at the scheduled times, every scan is stored at the burst's own time (default 50 ms), never longer than
+     the slot time in use. A burst predicted to fill < 1 % of full scale is skipped and logged.
+   - **Temperature:** logged with every slot (`blocks/temperature_c`) when the spectrometer has a sensor the SDK can
+     read (a cooled detector's thermistor). The Maya2000 Pro has none.
 7. At the stop time, or when you press Stop: cover the input. The **post-run dark set** covers the whole ladder again.
    Then the files are closed.
 
@@ -85,11 +89,15 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
 ## Files (`<Save to>\<date>_<label>_vNN\`, a new folder every time)
 - **`run_metadata.json`:**
   - the plan;
-  - device info (model, serial, SDK and actual minimum integration, electric-dark and nonlinearity flags);
-  - the integration-time ladder;
+  - device info (model, serial, SDK and actual minimum integration, electric-dark and nonlinearity flags, the SDK features
+    the device reports, its nonlinearity coefficients and its temperature source);
+  - the recording ladder, the dark times and the burst time;
   - the Windows time-sync status;
   - the auto-exposure rules;
   - final row counts.
+- **`run_summary.json`** (written when the run closes): slots and saturated slots, each integration change with its time,
+  bursts with their integration and realised scan rate, dark times and pre/post dark agreement, the usable-light window
+  with the sun elevation at each end, the clock-offset range, the temperature range and the version.
 - **`events.csv`:** a journal of every event, with UTC nanoseconds and local time.
 - **`spectra_YYYYMMDD_HHMM.h5`:** files rotate hourly. Each holds `wavelength_nm_device` and three groups:
   - **`blocks`**: one row per slot. Fields: `t_wall_ns`, `t_start_wall_ns`, `t_end_wall_ns`, `slot_index`, `segment` (0.2.0), `int_us`,
@@ -166,6 +174,7 @@ the source and are not comparable between species; they are used only to select 
   - `tests/gui_recorder_smoke.py`: window close and re-attach, y-scaling and recorder kill.
   - `tests/gui_schedule_running.py`: the Schedule tab during a run.
   - `tests/gui_save_spectrum.py`: Save spectrum file names, the two-column `.dpt` and its `.json`.
+  - `tests/gui_preflight.py`: the run's own exposure setting and the pre-flight checklist.
   - `tests/gui_time_range.py [run folder]`: the time range and opening a recorded run read-only (a synthetic day by
     default; give a real run folder to open that one, which is only read).
 - **Hardware:** dawn-to-dusk field runs on a Maya2000 Pro. The scan period equals the integration time from 8 to 500 ms,

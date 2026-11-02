@@ -4,4 +4,4 @@ Sibling of GammaKeeper. Records raw spectra on a fixed time grid with scheduled 
 over the whole integration-time ladder, and emission-line wavelength calibration against bundled NIST ASD line lists.
 """
 APP_NAME = "LightKeeper"
-VERSION = "0.3.7"
+VERSION = "0.3.8"

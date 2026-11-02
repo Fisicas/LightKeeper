@@ -150,3 +150,86 @@ def usable_window(times, par, fraction=USABLE_FRACTION, hold_s=USABLE_HOLD_S):
     if not len(idx):
         return None
     return times[int(idx[0])], times[int(idx[-1])]
+
+
+def summarize(run_dir, meta: dict) -> dict:
+    """run_summary.json: one file that answers "was this a good run?". Reads the run's own files after they are closed."""
+    from .schedule import solar_elevation
+    run_dir = Path(run_dir)
+    files = sorted(run_dir.glob("spectra_*.h5"))
+    it, tw, nsat, temp, dk = [], [], [], [], {}
+    for f in files:
+        with h5py.File(f, "r") as h:
+            if "blocks" in h:
+                b = h["blocks"]
+                it.append(b["int_us"][:]); tw.append(b["t_wall_ns"][:]); nsat.append(b["n_saturated_scans"][:])
+                if "temperature_c" in b:
+                    temp.append(b["temperature_c"][:])
+            if "dark_scans" in h:
+                g = h["dark_scans"]
+                lab = [x.decode() if isinstance(x, bytes) else str(x) for x in g["label"][:]]
+                for l, u, y in zip(lab, g["int_us"][:], g["spectrum"][:]):
+                    dk.setdefault(l, {}).setdefault(int(u), []).append(y)
+    it = np.concatenate(it) if it else np.zeros(0, int); tw = np.concatenate(tw) if tw else np.zeros(0, np.int64)
+    nsat = np.concatenate(nsat) if nsat else np.zeros(0)
+    loc = lambda ns: local_dt(int(ns)).isoformat(timespec="seconds")  # noqa: E731
+    changes = [dict(local=loc(tw[i]), from_ms=float(it[i - 1]) / 1000, to_ms=float(it[i]) / 1000)
+               for i in np.flatnonzero(np.diff(it) != 0) + 1]
+    agree = []
+    for u in sorted(set(dk.get("pre", {})) & set(dk.get("post", {}))):
+        pre, post = np.mean(dk["pre"][u], 0), np.mean(dk["post"][u], 0)
+        d = float(np.median(post - pre))
+        agree.append(dict(int_ms=u / 1000, median_post_minus_pre_counts=round(d, 1),
+                          relative_percent=round(100 * d / float(np.median(pre)), 2) if np.median(pre) else None))
+    plan = meta.get("plan", {}); lat, lon = float(plan.get("site_lat", 0)), float(plan.get("site_lon", 0))
+
+    def with_sun(t):
+        el = float(solar_elevation(np.array([np.datetime64(t.astimezone(dt.timezone.utc).replace(tzinfo=None), "ns")]), lat, lon)[0])
+        return dict(local=t.isoformat(timespec="seconds"), sun_elevation_deg=round(el, 2))
+    usable, above100 = {}, {}
+    if len(it):
+        v = load_run(run_dir)
+        times = [s["t"] for s in v["slots"]]; par = np.array([s["par"] for s in v["slots"]])
+        w = usable_window(times, par)
+        if w:
+            usable = dict(rule=f"420-700 nm dark-corrected rate above {USABLE_FRACTION:.0%} of the run's 99th percentile "
+                               f"for {USABLE_HOLD_S / 60:g} min", first_local=with_sun(w[0])["local"],
+                          first_sun_elevation_deg=with_sun(w[0])["sun_elevation_deg"], last_local=with_sun(w[1])["local"],
+                          last_sun_elevation_deg=with_sun(w[1])["sun_elevation_deg"])
+        a = np.flatnonzero(par > 100)
+        if len(a):
+            above100 = dict(rule="420-700 nm dark-corrected rate above 100 counts/s", first=with_sun(times[a[0]]), last=with_sun(times[a[-1]]))
+    clocks = [c["offset_s"] for c in meta.get("clock_checks", []) if c.get("ok")]
+    temp = np.concatenate(temp) if temp else np.zeros(0)
+    temp = temp[np.isfinite(temp)]
+    import csv
+    import re
+    rows = list(csv.reader((run_dir / "events.csv").open(encoding="utf-8"))) if (run_dir / "events.csv").exists() else []
+    skipped = sum(1 for r in rows if len(r) > 2 and r[2] == "burst_skipped")
+    bursts = meta.get("bursts_done") or []
+    if not bursts:                  # runs before 0.3.8: the burst_start/burst_end events carry the same numbers
+        start_ms = {}
+        for r in rows:
+            if len(r) > 3 and r[2] == "burst_start" and (m := re.match(r"#(\d+), ([\d.]+) ms", r[3])):
+                start_ms[m.group(1)] = float(m.group(2))
+            if len(r) > 3 and r[2] == "burst_end" and (m := re.match(r"#(\d+), (\d+) scans \(([\d.]+) per s\)", r[3])):
+                bursts.append(dict(id=int(m.group(1)), int_ms=start_ms.get(m.group(1)), scans=int(m.group(2)),
+                                   scans_per_s=float(m.group(3))))
+    return dict(
+        app=meta.get("app"), run=run_dir.name, written_local=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        recording=dict(start_local=meta.get("resolved_start_local") or meta.get("planned_start_local"),
+                       end_local=meta.get("recording_end_local"), segments=1 + len(meta.get("resumes", []))),
+        slots=dict(recorded=int(len(it)), with_saturation=int((nsat > 0).sum())),
+        exposure=dict(mode="automatic" if plan.get("auto_exposure") else "fixed",
+                      integration_times_ms=sorted({float(u) / 1000 for u in np.unique(it)}) if len(it) else []),
+        integration_changes=changes,
+        bursts=dict(done=len(bursts), skipped=skipped, int_ms=sorted({b["int_ms"] for b in bursts if b.get("int_ms") is not None}),
+                    scans_per_s_min=min((b["scans_per_s"] for b in bursts), default=None),
+                    scans_per_s_max=max((b["scans_per_s"] for b in bursts), default=None)),
+        dark_sets=dict(labels=sorted(dk), integration_times_ms=sorted({u / 1000 for l in dk.values() for u in l}),
+                       pre_post_agreement=agree, post_darks_delay_min=meta.get("post_darks_delay_min")),
+        usable_light=usable, signal_above_100_counts_per_s=above100,
+        clock_offset_s=dict(min=min(clocks), max=max(clocks), checks=len(clocks)) if clocks else {},
+        temperature_c=dict(source=meta.get("temperature_source"), min=round(float(temp.min()), 2), max=round(float(temp.max()), 2),
+                           mean=round(float(temp.mean()), 2)) if len(temp) else dict(source=meta.get("temperature_source"), logged=False),
+    )

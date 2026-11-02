@@ -86,7 +86,7 @@ class TestRecorder(unittest.TestCase):
         from lightkeeper.storage import LOCAL_TZ
         now = dt.datetime.now(LOCAL_TZ)
         b = now + dt.timedelta(seconds=14)
-        p = RunPlan(label=label, out_dir=str(self.out), start_now=True, stop_local=(now + dt.timedelta(seconds=stop_s)).isoformat(),
+        p = RunPlan(auto_exposure=True, label=label, out_dir=str(self.out), start_now=True, stop_local=(now + dt.timedelta(seconds=stop_s)).isoformat(),
                     ladder_ms=[8, 10, 20, 50, 100, 200], min_int_ms=8, max_int_ms=200, int_ms=100, dark_s_per_int=0.2, flush_s=2, rotate_min=60,
                     burst_every_min=60, burst_offset_min=b.minute + b.second / 60.0, burst_s=3, auto_resume_logon=False)
         f = self.procs.app_home() / "pending" / f"plan_{label}.json"

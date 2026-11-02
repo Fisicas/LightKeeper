@@ -31,6 +31,7 @@ from PySide6 import QtCore, QtGui, QtWidgets as Q  # noqa: E402
 from . import APP_NAME, VERSION  # noqa: E402
 from .calibration import LAMPS, fit_calibration, reference_lines, save_calibration  # noqa: E402
 from .devices import SIM_ID, list_devices, shutdown_sdk  # noqa: E402
+from . import clock  # noqa: E402
 from .engine import SAT_LEVEL, Engine  # noqa: E402
 from .icons import ICON_SVG, icon  # noqa: E402,F401
 from .link import RecorderLink  # noqa: E402
@@ -401,7 +402,8 @@ class Window(Q.QMainWindow):
         # metrics
         row = Q.QHBoxLayout(); row.setSpacing(28); outer.addLayout(row); self.m = {}
         for key, lab in [("slots", "Slots recorded"), ("int", "Integration, ms"), ("n", "Scans per slot"), ("peak", "Peak counts"),
-                         ("sat", "Saturated slots"), ("bursts", "Bursts"), ("darks", "Dark sets"), ("size", "Data written, MB")]:
+                         ("sat", "Saturated slots"), ("bursts", "Bursts"), ("darks", "Dark sets"), ("size", "Data written, MB"),
+                         ("temp", "Detector, °C")]:
             col = Q.QVBoxLayout(); col.setSpacing(0)
             a = Q.QLabel(lab); a.setObjectName("metric_label"); b = Q.QLabel("–"); b.setObjectName("metric")
             col.addWidget(a); col.addWidget(b); row.addLayout(col); self.m[key] = b
@@ -491,13 +493,23 @@ class Window(Q.QMainWindow):
         section(lay, "Acquisition")
         f = form(lay)
         self.slot_spin = dspin(0.05, 600, 1.0, 2, 0.5, "s"); f.addRow("Time slot", self.slot_spin)
+        self.run_exp = Combo(); self.run_exp.addItems(["Fixed", "Automatic"])
+        self.run_exp.setToolTip("Fixed: every slot at this integration time (default). Automatic: the time moves along the "
+                                "ladder between the limits below to keep the signal in range.")
+        self.run_int = dspin(1, 60000, 500, 1, 10, "ms")
+        self.run_int.setToolTip("Fixed integration time, or the starting time under automatic exposure")
+        f.addRow("Exposure", hbox(self.run_exp, self.run_int, stretch_first=False))
         self.min_spin = dspin(1, 60000, 500, 1, 1, "ms"); self.max_spin = dspin(1, 60000, 3000, 0, 100, "ms")
-        f.addRow("Integration", hbox(self.min_spin, "to", self.max_spin, stretch_first=False))
+        self.auto_range_row = hbox(self.min_spin, "to", self.max_spin, stretch_first=False)
+        f.addRow("Auto range", self.auto_range_row)
+        self.run_exp.currentIndexChanged.connect(lambda i: self.auto_range_row.setEnabled(i == 1))
+        self.auto_range_row.setEnabled(False)
         self.burst_every = dspin(0, 1440, 60, 0, 15, "min"); self.burst_off = dspin(0, 1439, 30, 0, 5, "min")
         self.burst_every.setToolTip("0 = no bursts")
         f.addRow("Burst every", hbox(self.burst_every, "at minute", self.burst_off, stretch_first=False))
         self.burst_s = dspin(1, 3600, 120, 0, 10, "s"); self.burst_int = dspin(1, 1000, 50, 0, 1, "ms")
-        f.addRow("Burst length", hbox(self.burst_s, "at most", self.burst_int, stretch_first=False))
+        self.burst_int.setToolTip("The burst's own integration time; it gets its own dark (never longer than the slot time in use)")
+        f.addRow("Burst length", hbox(self.burst_s, "at", self.burst_int, stretch_first=False))
         self.cb_pre = Q.QCheckBox("Before"); self.cb_post = Q.QCheckBox("After")
         self.cb_pre.setChecked(True); self.cb_post.setChecked(True)
         f.addRow("Dark sets", hbox(self.cb_pre, self.cb_post, stretch_first=False))
@@ -508,6 +520,10 @@ class Window(Q.QMainWindow):
         self.ladder_edit = Q.QLineEdit(",".join(f"{x:g}" for x in DEFAULT_LADDER_MS)); self.ladder_edit.setCursorPosition(0)
         self.ladder_edit.setToolTip("Integration times (ms) auto-exposure may use; every one gets a dark set"); f.addRow("Ladder, ms", self.ladder_edit)
         self.dark_s = dspin(0.1, 60, 5, 1, 1, "s"); f.addRow("Dark time each", self.dark_s)
+        self.long_dark = dspin(0, 60000, 3000, 0, 100, "ms")
+        self.long_dark.setToolTip("Fixed exposure also takes darks at this time, so the dark-drift model has the dark current at "
+                                  "two integration times. 0 = off.")
+        f.addRow("Long dark (fixed)", self.long_dark)
         self.cb_sd = Q.QCheckBox("Store the per-slot standard deviation"); self.cb_sd.setChecked(True); f.addRow("", self.cb_sd)
         self.lat = dspin(-90, 90, float(self.settings.value("site_lat", DEFAULT_SITE[0])), 5, 0.01, "°")
         self.lon = dspin(-180, 180, float(self.settings.value("site_lon", DEFAULT_SITE[1])), 5, 0.01, "°")
@@ -547,8 +563,10 @@ class Window(Q.QMainWindow):
             wdg.valueChanged.connect(self._update_schedule)
         for wdg in (self.start_edit, self.stop_edit):
             wdg.dateTimeChanged.connect(self._update_schedule)
-        for wdg in (self.slot_spin, self.min_spin, self.max_spin, self.burst_every, self.burst_off, self.burst_s, self.burst_int, self.dark_s):
+        for wdg in (self.slot_spin, self.min_spin, self.max_spin, self.burst_every, self.burst_off, self.burst_s, self.burst_int, self.dark_s,
+                    self.run_int, self.long_dark):
             wdg.valueChanged.connect(self._update_schedule)
+        self.run_exp.currentIndexChanged.connect(self._update_schedule)
         for wdg in (self.cb_sd, self.cb_pre, self.cb_post):
             wdg.toggled.connect(self._update_schedule)
         self.ladder_edit.editingFinished.connect(self._update_schedule)
@@ -827,6 +845,81 @@ class Window(Q.QMainWindow):
         self.sch_notice.setVisible(True); self.sch_text.setHtml(f"<p style='color:{ORANGE}'>Updating the schedule for the new site…</p>")
         QtCore.QTimer.singleShot(40, lambda: (self._update_schedule(), self.sch_notice.setVisible(False)))
 
+    def _last_runs(self, label):
+        """(newest run's metadata, newest run's metadata with the same label) in the Save in folder, or None."""
+        metas = []
+        try:
+            for d in Path(self.out_edit.text()).iterdir():
+                m = read_json(d / "run_metadata.json") if d.is_dir() else None
+                if m and m.get("planned_start_local"):
+                    metas.append(m)
+        except Exception:
+            return None, None
+        metas.sort(key=lambda m: m["planned_start_local"])
+        same = [m for m in metas if m.get("plan", {}).get("label") == label]
+        return (metas[-1] if metas else None), (same[-1] if same else None)
+
+    def _preflight(self, plan, e) -> list:
+        """[(level, text)], level ok / warn / bad: what to check before an unattended run."""
+        out = []
+        dl = e["dark_ladder_ms"]
+        if plan.auto_exposure:
+            out.append(("warn", f"Automatic exposure over {', '.join(f'{x:g}' for x in e['ladder_ms'])} ms: each change can step "
+                                "the band depths (handoff B2/B3). Fixed exposure avoids it."))
+        else:
+            out.append(("ok", f"Fixed exposure at {e['ladder_ms'][0]:g} ms"))
+        if e["bursts"]:
+            lvl = "warn" if e["burst_int_ms"] > e["ladder_ms"][0] else "ok"
+            out.append((lvl, f"{len(e['bursts'])} bursts at {e['burst_int_ms']:g} ms, with their own {e['burst_int_ms']:g} ms dark"
+                             + (" (longer than the shortest slot time)" if lvl == "warn" else "")))
+        if not (plan.pre_darks or plan.post_darks):
+            out.append(("bad", "No dark sets planned"))
+        elif len(dl) < 2:
+            out.append(("warn", f"Darks at one integration time only ({dl[0]:g} ms): the dark-drift model needs two (set Long dark)"))
+        else:
+            out.append(("ok", f"Darks at {', '.join(f'{x:g}' for x in dl)} ms"
+                              + ("" if plan.pre_darks and plan.post_darks else f" ({'pre' if plan.pre_darks else 'post'}-run only)")))
+        sp = site_problem(plan.site_lat, plan.site_lon)
+        out.append(("bad" if sp and (plan.start_event or plan.stop_event) else "warn", sp) if sp else
+                   ("ok", f"Site {site_text(plan.site_lat, plan.site_lon)}, time zone {LOCAL_TZ}"))
+        empty = [lab for k, lab in (("fiber_core_um", "fiber core"), ("diffuser_id", "diffuser"), ("diffuser_thickness_mm", "diffuser thickness"),
+                                    ("fiber_diffuser_mm", "fiber-diffuser distance"), ("view_az_deg", "view azimuth"),
+                                    ("view_el_deg", "view elevation"), ("site_alt_m", "site altitude"), ("window_state", "window"))
+                 if getattr(plan, k, None) in (None, "")]
+        if not plan.geometry:
+            empty.append("geometry")
+        if not plan.setup_photo:
+            empty.append("setup photo")
+        out.append(("warn", "Not filled: " + ", ".join(empty)) if empty else ("ok", "Setup fields filled"))
+        try:
+            ck = clock.sntp_query(timeout=1.5)
+        except Exception as ex:
+            ck = dict(ok=False, error=repr(ex))
+        if ck.get("ok"):
+            off = ck["offset_s"]
+            out.append(("warn" if abs(off) > clock.WARN_OFFSET_S else "ok", f"Clock offset {off:+.2f} s"))
+        else:
+            out.append(("warn", "Clock not checked (no network?)"))
+        need, free = e.get("data_bytes", 0) / 1e9, e["disk_free_gb"]
+        if free == free:                     # not NaN
+            out.append(("bad" if need > free else "warn" if need > 0.5 * free else "ok",
+                        f"Disk: about {need:.2f} GB needed, {free:.0f} GB free"))
+        last, same = self._last_runs(plan.label)
+        if last:
+            lp = last.get("plan", {})
+            if (bool(lp.get("edc", True)), bool(lp.get("nlc", True))) != (plan.edc, plan.nlc):
+                out.append(("warn", f"Electric dark / nonlinearity {plan.edc}/{plan.nlc} differ from the last run "
+                                    f"({lp.get('edc')}/{lp.get('nlc')}, {Path(str(lp.get('out_dir', ''))).name or 'previous run'})"))
+        if same and (same.get("plan", {}).get("diffuser_id") or "") != (plan.diffuser_id or ""):
+            out.append(("warn", f"Diffuser '{plan.diffuser_id or '(empty)'}' differs from the last '{plan.label}' run "
+                                f"('{same['plan'].get('diffuser_id') or '(empty)'}')"))
+        ts = str(self.info.get("temperature_source", ""))
+        if ts and not ts.startswith("none"):
+            out.append(("ok", f"Temperature logged every slot ({ts})"))
+        else:
+            out.append(("warn", "No readable temperature on this spectrometer: not logged (the Maya2000 Pro has no sensor the SDK can read)"))
+        return out
+
     def _show_site(self):
         lat, lon = self.lat.value(), self.lon.value(); bad = site_problem(lat, lon)
         self.site_lbl.setText(site_text(lat, lon) + (f"\n{bad}" if bad else ""))
@@ -859,7 +952,8 @@ class Window(Q.QMainWindow):
                        stop_offset_min=self.stop_off.value(),
                        start_local=self.start_edit.dateTime().toPython().replace(tzinfo=LOCAL_TZ).isoformat(),
                        stop_local=self.stop_edit.dateTime().toPython().replace(tzinfo=LOCAL_TZ).isoformat(),
-                       slot_s=self.slot_spin.value(), auto_exposure=self.exp_mode.currentIndex() == 0, int_ms=self.int_spin.value(),
+                       slot_s=self.slot_spin.value(), auto_exposure=self.run_exp.currentIndex() == 1, int_ms=self.run_int.value(),
+                       long_dark_ms=self.long_dark.value(),
                        min_int_ms=self.min_spin.value(), max_int_ms=self.max_spin.value(), ladder_ms=ladder,
                        edc=self.cb_edc.isChecked(), nlc=self.cb_nlc.isChecked(), store_sd=self.cb_sd.isChecked(),
                        burst_every_min=self.burst_every.value(), burst_offset_min=self.burst_off.value(), burst_s=self.burst_s.value(),
@@ -900,9 +994,17 @@ class Window(Q.QMainWindow):
                f"{'Stop event: ' + plan.stop_event + f' {plan.stop_offset_min:+g} min' + chr(10) if plan.stop_event else ''}"
                f"Stop: {e['stop']:%Y-%m-%d %H:%M}  ({e['duration_h']:.2f} h, {e['slots']:,} slots of {plan.slot_s:g} s)\n"
                f"Bursts: {len(e['bursts'])} × {plan.burst_s:g} s at {e['burst_int_ms']:g} ms\n"
-               f"Dark sets: {'pre ' if plan.pre_darks else ''}{'post' if plan.post_darks else ''} · ~{e['dark_session_s']:.0f} s each over {len(e['ladder_ms'])} integration times\n"
-               f"Estimated data: {e['data_gb_uncompressed']:.2f} GB (free {e['disk_free_gb']:.0f} GB)\n\nStart this run?")
-        if not self._ask("Start run", txt, "Start", "Cancel"):
+               f"Exposure: {'automatic, ' + ', '.join(f'{x:g}' for x in e['ladder_ms']) + ' ms' if plan.auto_exposure else 'fixed at ' + format(e['ladder_ms'][0], 'g') + ' ms'}\n"
+               f"Dark sets: {'pre ' if plan.pre_darks else ''}{'post' if plan.post_darks else ''} · ~{e['dark_session_s']:.0f} s each at {', '.join(f'{x:g}' for x in e['dark_ladder_ms'])} ms\n"
+               f"Estimated data: {e['data_gb_uncompressed']:.2f} GB (free {e['disk_free_gb']:.0f} GB)")
+        checks = self._preflight(plan, e)
+        sym = {"ok": "✔", "warn": "⚠", "bad": "✖"}
+        txt += "\n\nPre-flight checks\n" + "\n".join(f"{sym[lv]}  {t}" for lv, t in checks)
+        worst = "bad" if any(lv == "bad" for lv, _ in checks) else "warn" if any(lv == "warn" for lv, _ in checks) else "ok"
+        self._log("pre-flight: " + "; ".join(f"{lv} {t}" for lv, t in checks))
+        txt += "\n\n" + ("Start anyway?" if worst == "bad" else "Start this run?")
+        if not self._ask("Start run" if worst != "bad" else "Start run: problems found", txt,
+                         "Start anyway" if worst == "bad" else "Start", "Cancel"):
             return
         if plan.pre_darks and not self._ask("Pre-run darks",
                                             "Cover the input completely (foil + cap) and keep it covered until LightKeeper asks you to uncover it.\n\n"
@@ -1255,6 +1357,7 @@ class Window(Q.QMainWindow):
         self._next_burst = e.get("next_burst", "")
         self.m["slots"].setText(f"{e['n_slots']:,}"); self.m["size"].setText(f"{e['size_mb']:.0f}"); self.m["int"].setText(f"{e['int_us'] / 1000:g}")
         self.m["n"].setText(str(e["n"])); self.m["peak"].setText(f"{e['bmax']:,.0f}"); self.m["sat"].setText(str(e["n_sat_slots"]))
+        self.m["temp"].setText(f"{e['temp_c']:.1f}" if e.get("temp_c") is not None else "–")
         self._dirty_ts = True
 
     def _update_mask(self):
@@ -1534,8 +1637,9 @@ class Window(Q.QMainWindow):
             stop_txt += f"<br><span style='color:{TEXT2}'>{plan.stop_event}, {plan.stop_offset_min:+g} min</span>"
         bursts = ", ".join(f"{b:%H:%M}" for b in e["bursts"])
         rows = [("Start", start_txt), ("Stop", stop_txt), ("Duration", f"{e['duration_h']:.2f} h, {e['slots']:,} slots of {plan.slot_s:g} s"),
-                ("Exposure", f"{'Automatic' if plan.auto_exposure else 'Fixed'}, starting at {plan.int_ms:g} ms"),
-                ("Ladder", f"{', '.join(f'{x:g}' for x in e['ladder_ms'])} ms"),
+                ("Exposure", f"Automatic, {', '.join(f'{x:g}' for x in e['ladder_ms'])} ms, starting at {plan.int_ms:g} ms"
+                             if plan.auto_exposure else f"Fixed at {e['ladder_ms'][0]:g} ms"),
+                ("Dark times", f"{', '.join(f'{x:g}' for x in e['dark_ladder_ms'])} ms"),
                 ("Dark sets", f"{' and '.join(x for x, on in (('before', plan.pre_darks), ('after', plan.post_darks)) if on) or 'none'}, "
                               f"about {e['dark_session_s']:.0f} s each ({e['dark_scans_total']:,} scans)"),
                 ("Bursts", f"{len(e['bursts'])} of {plan.burst_s:g} s at {e['burst_int_ms']:g} ms" + (f": {bursts}" if bursts else "")),

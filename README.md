@@ -18,8 +18,10 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
 - **Raw data on a fixed grid.** Each slot (default 1 s) stores the per-pixel mean and standard deviation of every scan
   in that slot, plus the exposure, saturation and timing. Files are HDF5 and rotate hourly. Nothing is dark-subtracted,
   smoothed or resampled.
-- **Dark sets you can trust.** Before and after the run, LightKeeper records darks at every rung of the
-  integration-time ladder. Auto-exposure moves only along that ladder, so every recorded slot has a matching dark.
+- **Fixed exposure by default.** A run records at one integration time (500 ms) unless you choose automatic exposure,
+  which moves along a ladder of integration times.
+- **Dark sets you can trust.** Before and after the run, LightKeeper records darks at every integration time the run
+  can use: the fixed time (or the whole ladder), the burst time, and a second long time for the dark-drift model.
   Each dark set also lists the detector's hot and cold pixels, which the display hides; the raw data keep them.
 - **Sun-event scheduling.** Start and stop can be tied to astronomical, nautical or civil dawn and dusk, or to sunrise
   and sunset, each with an offset. The NOAA/Meeus solar position is used. Times are fixed when you press Start, and
@@ -35,6 +37,10 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
   offset is saved with the data.
 - **Wavelength calibration.** Fit the axis from emission-line lamps (Hg-Ar, Ne, Ar, Kr, Xe, He, H, Cd, Zn and more)
   against bundled NIST ASD line lists. The device EEPROM is never changed.
+- **Temperature, where the hardware has it.** Spectrometers with a readable detector thermistor log a temperature with
+  every slot. The Maya2000 Pro has none, and the run says so.
+- **A summary of every run.** `run_summary.json` lists integration changes, bursts, dark agreement, usable light and
+  clock offsets, and the Start dialog runs a pre-flight checklist.
 - **Setup metadata.** The fiber, diffuser, view azimuth and elevation, window state, site altitude and a setup photo are
   stored with each run.
 
@@ -104,7 +110,7 @@ The tests run against the simulator:
 - the clock check, with a mocked socket;
 - the 2026 daylight-saving change.
 
-The GUI checks (`tests/gui_recorder_smoke.py`, `tests/gui_schedule_running.py`, `tests/gui_save_spectrum.py`, `tests/gui_time_range.py`) are scripts that run off-screen with
+The GUI checks (`tests/gui_recorder_smoke.py`, `tests/gui_schedule_running.py`, `tests/gui_save_spectrum.py`, `tests/gui_time_range.py`, `tests/gui_preflight.py`) are scripts that run off-screen with
 `QT_QPA_PLATFORM=offscreen`. `python -X utf8 tools/make_social.py` rebuilds the social preview and icon.
 
 ## Status

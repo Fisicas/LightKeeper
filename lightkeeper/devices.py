@@ -116,6 +116,28 @@ class OceanDevice:
         self.set_corrections(edc, nlc)
         self.int_us = int(_try(self.dev.get_integration_time, 100000))
         self.mode = "sky"
+        self.features = self._features()
+        # the SDK reads a temperature only through a thermo-electric cooler's thermistor; the Maya2000 Pro has none
+        # (OceanDirect release notes: "Removed temperature feature from MayaPro device")
+        self.temperature_source = "TEC thermistor" if self.features.get("THERMOELECTRIC") else ""
+        self.nlc_coeffs = _try(lambda: [float(x) for x in self.dev.Advanced.get_nonlinearity_coeffs()], None)
+
+    def _features(self) -> dict:
+        """{FeatureID name: supported} as the SDK reports them for this device."""
+        try:
+            from oceandirect.OceanDirectAPI import FeatureID
+        except Exception:
+            return {}
+        out = {}
+        for f in FeatureID:
+            out[f.name] = _try(lambda f=f: bool(self.dev.is_feature_id_enabled(f)), None)
+        return out
+
+    def temperature_c(self):
+        """Detector temperature in degC, or None when the device has no readable sensor or the read fails."""
+        if not self.temperature_source:
+            return None
+        return _try(lambda: float(self.dev.Advanced.get_tec_temperature_degrees_C()), None)
 
     def set_corrections(self, edc: bool, nlc: bool):
         _try(lambda: self.dev.set_electric_dark_correction_usage(bool(edc)))
@@ -138,7 +160,10 @@ class OceanDevice:
                     wl_first=float(self.wavelengths[0]), wl_last=float(self.wavelengths[-1]),
                     sdk_min_int_us=self.sdk_min_us, min_int_us_used=self.min_us, max_int_us=self.max_us,
                     electric_dark_correction=self.edc, nonlinearity_correction=self.nlc,
-                    scans_to_average_device=1, boxcar=0)
+                    scans_to_average_device=1, boxcar=0,
+                    features_supported=sorted(k for k, v in self.features.items() if v),
+                    temperature_source=self.temperature_source or "none (no readable sensor on this device)",
+                    nonlinearity_coeffs=self.nlc_coeffs)
 
     def close(self):
         _try(lambda: self.api.close_device(self.device_id))
@@ -167,6 +192,7 @@ class SimDevice:
         self.serial, self.model = "SIM0001", "Simulator"
         self.rng = np.random.default_rng(1)
         self.t0 = time.perf_counter()
+        self.temperature_source = "simulated" if os.environ.get("LIGHTKEEPER_SIM_TEMPERATURE", "1") != "0" else ""
         self.mode = "sky"
         self.lamp_lines = None   # (wl array, rel array)
 
@@ -193,8 +219,13 @@ class SimDevice:
         y = y + self.rng.normal(0, 1, y.size) * np.sqrt(np.abs(y) + 25)
         return np.minimum(y, 61380.0)
 
+    def temperature_c(self):
+        if not self.temperature_source:
+            return None
+        return 24.0 + 1.5 * math.sin(2 * math.pi * (time.perf_counter() - self.t0) / 600)   # slow drift, degC
+
     def info(self):
-        return dict(kind="SIMULATED", serial=self.serial, model=self.model, pixels=len(self.wavelengths),
+        return dict(kind="SIMULATED", temperature_source=self.temperature_source or "none (no readable sensor on this device)", serial=self.serial, model=self.model, pixels=len(self.wavelengths),
                     sdk_min_int_us=self.sdk_min_us, min_int_us_used=self.min_us, max_int_us=self.max_us,
                     electric_dark_correction=self.edc, nonlinearity_correction=self.nlc, scans_to_average_device=1, boxcar=0)
 
