@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.6 (2026-11-01)
+- **Save spectrum (Ctrl+S).** Saves the scan on screen, processed as displayed (dark subtraction, hidden pixels
+  bridged, counts or counts/s, display axis), to `<Save in>\..\spectra\<label>_<YYYY-MM-DD_HH-MM-SS>.dpt`. With no
+  label the name is the scan time. The `.dpt` holds only two comma-separated columns (wavelength in nm, signal), so
+  OPUS and other programs open it as a data point table. A `.json` with the same name holds the details: time,
+  integration, device and corrections, processing, setup fields, site, and the raw and dark counts.
+- **Geometry starts empty.** The last development prefill is gone; it shows an example instead.
+
 ## 0.3.5 (2026-11-01)
 - **Opens the spectrometer by itself.** Like OceanView, the window opens the first attached Ocean spectrometer and
   starts the live view at a fixed 100 ms, one scan per update, without pressing Connect. A spectrometer plugged in

@@ -35,7 +35,7 @@ from .icons import ICON_SVG, icon  # noqa: E402,F401
 from .link import RecorderLink  # noqa: E402
 from .procs import (app_home, entry_args, live_sessions, open_runs, read_json, spawn_detached, supervisor_alive,  # noqa: E402
                     write_json_atomic)
-from .schedule import DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, solar_day, sun_events  # noqa: E402
+from .schedule import SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, solar_day, sun_events  # noqa: E402
 from .storage import LOCAL_TZ, local_dt  # noqa: E402
 
 from . import hotpix, theme  # noqa: E402
@@ -205,7 +205,7 @@ class Window(Q.QMainWindow):
             self.settings = QtCore.QSettings("LightKeeper", "LightKeeper")
         self.engine = Engine(); self.engine.start()
         self.state = "DISCONNECTED"; self.info = {}; self.wl_dev = None; self.axis = None; self.axis_label = "device axis"
-        self.latest = None; self.latest_int = None; self.darks = {}; self.valid = None; self.hot = None
+        self.latest = None; self.latest_int = None; self.latest_t = None; self.darks = {}; self.valid = None; self.hot = None
         self.slots = []; self.spectra = []; self.spec_stride = 1; self._slot_count = 0; self._dirty_ts = False
         self.run_dir = None; self.plan = None; self.run_plan = None; self.run_times = None; self.cal = {}; self.cal_result = None; self.n_bursts = 0; self._last_ts_draw = 0.0
         self._dialog = False; self._last_live = 0; self._scan_new = False
@@ -237,6 +237,7 @@ class Window(Q.QMainWindow):
         self.clock_lbl = Q.QLabel(""); self.statusBar().addPermanentWidget(self.clock_lbl)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+B"), self, activated=lambda: self._set_setup_visible(not self.setup.isVisible()))
         QtGui.QShortcut(QtGui.QKeySequence("F11"), self, activated=self._toggle_full)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self._save_spectrum)
         self._set_setup_visible(self.settings.value("setup_visible", True, type=bool), remember=False)
         self._set_state("DISCONNECTED")
 
@@ -306,7 +307,7 @@ class Window(Q.QMainWindow):
         section(lay, "Run")
         f = form(lay)
         self.label_edit = Q.QLineEdit(""); self.label_edit.setPlaceholderText("e.g. rooftop_south_diffuser"); f.addRow("Label", self.label_edit)
-        self.geom_edit = Q.QLineEdit("50 um fiber + polystyrene diffuser, facing 210 deg, horizontal"); f.addRow("Geometry", self.geom_edit)
+        self.geom_edit = Q.QLineEdit(""); self.geom_edit.setPlaceholderText("e.g. 50 um fiber + diffuser, facing south"); f.addRow("Geometry", self.geom_edit)
         self.geom_edit.setCursorPosition(0)
         self.notes_edit = Q.QLineEdit(""); self.notes_edit.setPlaceholderText("Sky, window, anything unusual"); f.addRow("Notes", self.notes_edit)
         # 0.3.1 structured setup; a spin box at its minimum shows "not set" and is stored as None
@@ -465,6 +466,10 @@ class Window(Q.QMainWindow):
         dm.addSeparator()
         hint = dm.addAction("Wheel stretches y, Shift+wheel zooms x, Ctrl+wheel both; double-click resets"); hint.setEnabled(False)
         disp.setMenu(dm); r.addWidget(disp)
+        self.btn_save_spec = Q.QPushButton("Save spectrum")
+        self.btn_save_spec.setToolTip("Save the scan on screen as it is shown (Ctrl+S): <label>_<date>_<time>.dpt, two columns "
+                                      "(wavelength nm, counts) that OPUS opens, plus a .json with the details, in <Save in>\\..\\spectra")
+        self.btn_save_spec.clicked.connect(self._save_spectrum); r.addWidget(self.btn_save_spec)
         for c in (self.cb_auto, self.cb_dark, self.cb_rate, self.cb_log, self.cb_mask, self.cb_cal):
             c.toggled.connect(lambda *_: self._draw_live(force=True))
         r.addStretch(1); self.live_info = Q.QLabel(""); self.live_info.setObjectName("secondary"); r.addWidget(self.live_info)
@@ -620,6 +625,49 @@ class Window(Q.QMainWindow):
     def _toggle_preview(self):
         on = self.state != "PREVIEW"
         self.engine.send("preview", on, self.exp_mode.currentIndex() == 0, self.int_spin.value() if self.exp_mode.currentIndex() == 1 else None)
+
+    def _save_spectrum(self):
+        """The scan on screen, processed exactly as displayed, as <label>_<YYYY-MM-DD_HH-MM-SS>.dpt (two comma-separated
+        columns, wavelength and signal: what OPUS imports as a data point table) plus a .json with the details."""
+        if self.latest is None or self.wl_dev is None:
+            self.statusBar().showMessage("Nothing to save: start the live view first.", 8000); return
+        us = int(self.latest_int or 0); raw = np.asarray(self.latest, float); y = raw.copy()
+        d = self.darks.get(us); sub = self.cb_dark.isChecked() and d is not None
+        if sub:
+            y = y - d
+        bridged = []
+        if self.cb_mask.isChecked() and self.valid is not None and not self.valid.all():
+            y = hotpix.fill(y, self.valid); bridged = [int(i) for i in np.flatnonzero(~self.valid)]
+        rate = self.cb_rate.isChecked() and us > 0
+        if rate:
+            y = y * 1e6 / us
+        x = self._x()
+        t = local_dt(int(self.latest_t)) if self.latest_t else dt.datetime.now(LOCAL_TZ)
+        label = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.label_edit.text().strip()).strip("_")
+        stem = f"{label}_{t:%Y-%m-%d_%H-%M-%S}" if label else f"{t:%Y-%m-%d_%H-%M-%S}"
+        folder = Path(self.out_edit.text()).parent / "spectra"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{stem}.dpt"; k = 2
+            while path.exists():
+                path = folder / f"{stem}_{k}.dpt"; k += 1
+            np.savetxt(path, np.c_[x, y], delimiter=",", fmt=["%.4f", "%.4f"])
+            plan = self._plan()
+            meta = dict(app=f"{APP_NAME} {VERSION}", file=path.name, columns=["wavelength_nm", "counts_per_s" if rate else "counts"],
+                        scan_time_local=t.isoformat(), integration_ms=us / 1000, scans_averaged=1,
+                        device={k_: self.info.get(k_) for k_ in ("model", "serial", "kind", "electric_dark_correction",
+                                                                 "nonlinearity_correction", "pixels")},
+                        wavelength_axis=self.axis_label, dark_subtracted=bool(sub), counts_per_second=bool(rate),
+                        hot_cold_pixels_bridged=bridged, label=self.label_edit.text().strip(), notes=plan.notes,
+                        geometry=plan.geometry, setup={k_: getattr(plan, k_) for k_ in SETUP_FIELDS},
+                        site=dict(lat=plan.site_lat, lon=plan.site_lon),
+                        raw_counts=[round(float(v), 2) for v in raw], dark_counts=[round(float(v), 2) for v in d] if sub else None)
+            path.with_suffix(".json").write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
+        except Exception as e:
+            Q.QMessageBox.warning(self, APP_NAME, f"Spectrum not saved: {e!r}"); return
+        self._log(f"spectrum saved: {path} ({us / 1000:g} ms, {'dark-subtracted' if sub else 'raw'}"
+                  f"{', ' + str(len(bridged)) + ' hot/cold pixels bridged' if bridged else ''})")
+        self.statusBar().showMessage(f"Saved {path.name} in {folder}", 10000)
 
     def _show_site(self):
         lat, lon = self.lat.value(), self.lon.value(); bad = site_problem(lat, lon)
@@ -794,7 +842,7 @@ class Window(Q.QMainWindow):
             if t == "detached":
                 self._on_detached(); return
             if t == "scan":
-                self.latest, self.latest_int = e["y"], e["int_us"]; self._scan_new = True
+                self.latest, self.latest_int, self.latest_t = e["y"], e["int_us"], e.get("t_ns"); self._scan_new = True
             elif t == "slot":
                 self._on_slot(e)
             elif t == "state":
@@ -892,7 +940,7 @@ class Window(Q.QMainWindow):
         for ev in snap.get("history", []):
             self._on_slot(ev)
         if snap.get("scan"):
-            self.latest, self.latest_int = snap["scan"]["y"], snap["scan"]["int_us"]; self._scan_new = True
+            self.latest, self.latest_int, self.latest_t = snap["scan"]["y"], snap["scan"]["int_us"], snap["scan"].get("t_ns"); self._scan_new = True
         c = snap.get("counters", {})
         self.n_bursts = int(c.get("bursts", 0)); self.m["bursts"].setText(str(self.n_bursts)); self.m["darks"].setText(str(c.get("dark_sets", 0)))
         if snap.get("int_us"):
