@@ -38,7 +38,7 @@ from .procs import (app_home, entry_args, live_sessions, open_runs, read_json, s
 from .schedule import DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, solar_day, sun_events  # noqa: E402
 from .storage import LOCAL_TZ, local_dt  # noqa: E402
 
-from . import theme  # noqa: E402
+from . import hotpix, theme  # noqa: E402
 from .theme import BLUE, GREEN, LAMP, LINE, ORANGE, RED, SURFACE, TEXT, TEXT2, TEXT3, VIOLET  # noqa: E402
 
 # legacy colour names used by the drawing code, mapped onto the theme tokens
@@ -180,7 +180,7 @@ class Window(Q.QMainWindow):
         self.settings = QtCore.QSettings("LightKeeper", "LightKeeper")
         self.engine = Engine(); self.engine.start()
         self.state = "DISCONNECTED"; self.info = {}; self.wl_dev = None; self.axis = None; self.axis_label = "device axis"
-        self.latest = None; self.latest_int = None; self.darks = {}; self.valid = None
+        self.latest = None; self.latest_int = None; self.darks = {}; self.valid = None; self.hot = None
         self.slots = []; self.spectra = []; self.spec_stride = 1; self._slot_count = 0; self._dirty_ts = False
         self.run_dir = None; self.plan = None; self.run_plan = None; self.run_times = None; self.cal = {}; self.cal_result = None; self.n_bursts = 0; self._last_ts_draw = 0.0
         self._dialog = False; self._last_live = 0; self._scan_new = False
@@ -420,7 +420,8 @@ class Window(Q.QMainWindow):
         self.cb_cal = dm.addAction("Calibrated wavelength axis")
         for a in (self.cb_dark, self.cb_rate, self.cb_log, self.cb_mask, self.cb_cal):
             a.setCheckable(True)
-        self.cb_mask.setChecked(True); self.cb_cal.setEnabled(False)
+        self.cb_mask.setChecked(self.settings.value("hide_hot_pixels", True, type=bool)); self.cb_cal.setEnabled(False)
+        self.cb_mask.toggled.connect(lambda on: (self.settings.setValue("hide_hot_pixels", on), self._draw_waterfall()))
         dm.addSeparator()
         hint = dm.addAction("Wheel stretches y, Shift+wheel zooms x, Ctrl+wheel both; double-click resets"); hint.setEnabled(False)
         disp.setMenu(dm); r.addWidget(disp)
@@ -715,6 +716,7 @@ class Window(Q.QMainWindow):
                 QtCore.QTimer.singleShot(50, self._ask_post_dark)
             elif t == "device":
                 self.info = e["info"]; self.wl_dev = np.asarray(e["wavelengths"]); self.axis = self.wl_dev.copy(); self.valid = np.ones(len(self.axis), bool)
+                self.hot = None   # the engine follows with this spectrometer's saved list, if it has one
                 i = self.info
                 onoff = lambda v: "on" if v else ("off" if v is False else "not supported")
                 self.dev_info.setText(f"{i.get('model', '')} {i.get('serial', '')}, {i.get('pixels')} pixels, "
@@ -737,6 +739,8 @@ class Window(Q.QMainWindow):
                 self.progress.setVisible(True); self.progress.setValue(int(100 * e["frac"])); self.progress.setFormat(e["what"])
             elif t == "darks":
                 self.darks = {int(k): np.asarray(v) for k, v in e["darks"].items()}; self._update_mask()
+            elif t == "hot_pixels":
+                self.hot = {k: v for k, v in e.items() if k != "type"}; self._update_mask(); self._draw_live(force=True)
                 self.m["darks"].setText(str(int(self.m["darks"].text()) + 1 if self.m["darks"].text().isdigit() else 1))
             elif t == "run":
                 self.run_dir = e["dir"]; self.run_lbl.setText(Path(e["dir"]).name); self.run_lbl.setToolTip(e["dir"]); self.m["darks"].setText("0")
@@ -782,6 +786,8 @@ class Window(Q.QMainWindow):
             self._handle(dict(type="run", **snap["run"]))
         if snap.get("darks"):
             self._handle(dict(type="darks", darks=snap["darks"]))
+        if snap.get("hot"):
+            self._handle(dict(type="hot_pixels", **snap["hot"]))
         for ev in snap.get("history", []):
             self._on_slot(ev)
         if snap.get("scan"):
@@ -914,17 +920,28 @@ class Window(Q.QMainWindow):
         self._dirty_ts = True
 
     def _update_mask(self):
-        """hide pixels that are hot/cold in the longest-integration dark (|excess over 15-px median| > 6 robust sigma)."""
-        from scipy.ndimage import median_filter
-        if not self.darks or self.axis is None:
+        """Pixels hidden by 'Hide hot and cold pixels': the list found from the dark sets (hotpix), or, for a run without
+        one (recorded by LightKeeper 0.3.3 or earlier), outliers in the longest-integration mean dark."""
+        if self.axis is None:
             return
-        us = max(self.darks); d = self.darks[us]
-        ex = d - median_filter(d, 15, mode="nearest"); core = ex[30:-30]
-        s = 1.4826 * np.median(np.abs(core - np.median(core)))
-        bad = np.abs(ex) > 6 * s; bad[:30] = bad[-30:] = False
+        bad = np.zeros(len(self.axis), bool)
+        if self.hot:
+            idx = [i for i in list(self.hot.get("hot", [])) + list(self.hot.get("cold", [])) if 0 <= int(i) < len(bad)]
+            bad[np.asarray(idx, int)] = True
+            src = self.hot.get("source", "dark sets")
+        elif self.darks:
+            from scipy.ndimage import median_filter
+            us = max(self.darks); d = self.darks[us]
+            ex = d - median_filter(d, 15, mode="nearest"); core = ex[30:-30]
+            sg = 1.4826 * np.median(np.abs(core - np.median(core)))
+            bad = np.abs(ex) > 6 * sg; bad[:30] = bad[-30:] = False
+            src = f"{us / 1000:g} ms mean dark"
+        else:
+            self.valid = np.ones(len(self.axis), bool); return
         self.valid = ~bad
-        self._log(f"hot/cold pixels from {us / 1000:g} ms dark: {int(bad.sum())} hidden at "
-                  f"{', '.join(f'{x:.1f}' for x in self.axis[bad][:25])} nm")
+        self.cb_mask.setToolTip(f"{int(bad.sum())} pixels, from the {src}")
+        self._log(f"hot/cold pixels from the {src}: {int(bad.sum())} hidden at "
+                  f"{', '.join(f'{x:.1f}' for x in self.axis[bad][:40])} nm")
 
     # =================================================================== drawing
     def _x(self):
@@ -955,7 +972,9 @@ class Window(Q.QMainWindow):
         if self.cb_auto.isChecked():
             a0.set_xlim(x[0], x[-1]); self._fit_y(a0)
         peak = float(np.max(y[show])) if show.any() else 0
-        self.live_info.setText(f"{us / 1000:g} ms, peak {peak:,.0f} counts, {'matched dark available' if d is not None else 'no matched dark'}, {self.axis_label}")
+        hidden = int((~show).sum())
+        self.live_info.setText(f"{us / 1000:g} ms, peak {peak:,.0f} counts, {'matched dark available' if d is not None else 'no matched dark'}, "
+                               + (f"{hidden} hot/cold pixels hidden, " if hidden else "") + self.axis_label)
         if force or len(self.spectra) and getattr(self, "_drawn_spec", 0) != len(self.spectra):
             xl = a0.get_xlim()
             a1.cla(); style_ax(a1); a1.set_title("Recent slots, newest brightest")
@@ -1075,7 +1094,9 @@ class Window(Q.QMainWindow):
             return
         a = self.c_wf.ax[0]; a.cla(); style_ax(a)
         R = np.array([r for _, r in self.spectra], float); t = [s for s, _ in self.spectra]
-        x = self.axis; m = (x > 380) & (x < 1050) & self.valid
+        if self.cb_mask.isChecked() and self.valid is not None:
+            R = hotpix.fill(R, self.valid)
+        x = self.axis; m = (x > 380) & (x < 1050)
         mode = self.wf_mode.currentIndex()
         with np.errstate(divide="ignore", invalid="ignore"):
             if mode == 0:

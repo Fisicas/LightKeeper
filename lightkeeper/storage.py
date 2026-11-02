@@ -164,5 +164,16 @@ class Writer:
             self.buf[table] = []
         self.last_flush = mono_ns()
 
+    def set_attrs(self, **kw):
+        """Add file attributes: to the files already written and to every later hourly file."""
+        self.attrs.update(kw)
+        for fn in self.files:
+            try:
+                with h5py.File(self.alt.get(Path(fn), Path(fn)), "a") as f:
+                    for k, v in kw.items():
+                        f.attrs[k] = json.dumps(v, default=str) if isinstance(v, (dict, list, tuple)) or v is None else v
+            except Exception as e:
+                self.notes.append(f"{Path(fn).name}: attributes {sorted(kw)} not written ({e!r})")
+
     def size_mb(self) -> float:
         return sum(Path(p).stat().st_size for p in self.files if Path(p).exists()) / 1e6

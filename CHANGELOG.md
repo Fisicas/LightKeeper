@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.4 (2026-11-01)
+- **Hot and cold pixels from the dark sets.**
+  - After each dark set, the individual scans at the longest integration time are searched: a pixel is listed when it
+    is more than 5 robust sigma above or below a 15-pixel running median in at least 80 % of those scans.
+  - The run stores the list in `run_metadata.json` and as `hot_pixels` / `cold_pixels` attributes on its HDF5 files.
+    Raw spectra are unchanged.
+  - The latest list for each spectrometer is remembered, so **Hide hot and cold pixels** now works in the live view
+    outside a run too. Before, it worked only once a run had darks.
+  - The waterfall bridges hidden pixels instead of dropping them, so its wavelength axis stays exact.
+  - The Display setting is remembered.
+
 ## 0.3.3 (2026-11-01): first public release
 - **Portable defaults.**
   - The run folder is `Documents\LightKeeper Runs`, or `LIGHTKEEPER_DATA_ROOT`.

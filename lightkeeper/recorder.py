@@ -160,7 +160,7 @@ class Recorder(QtCore.QObject):
             self.serial = args.serial
             self.run_status = None
         self.state, self.detail = "DISCONNECTED", "starting"
-        self.device = None; self.run = None; self.darks = None; self.scan = None; self.int_us = None
+        self.device = None; self.run = None; self.darks = None; self.hot = None; self.scan = None; self.int_us = None
         self.counters = dict(bursts=0, dark_sets=0)
         self.recent = collections.deque(maxlen=HISTORY_RECENT); self.sparse = []; self.sparse_stride = 1; self.n_hist = 0
         self.logs = collections.deque(maxlen=500)
@@ -290,7 +290,7 @@ class Recorder(QtCore.QObject):
     # ---------------------------------------------------------------- snapshot for a window that attaches
     def _snapshot(self):
         return dict(type="snapshot", pid=os.getpid(), serial=self.serial, version=VERSION, state=self.state, detail=self.detail,
-                    device=self.device, run=self.run, darks=self.darks, scan=self.scan, int_us=self.int_us,
+                    device=self.device, run=self.run, darks=self.darks, hot=self.hot, scan=self.scan, int_us=self.int_us,
                     counters=dict(self.counters), history=list(self.sparse) + list(self.recent), sparse_stride=self.sparse_stride,
                     logs=list(self.logs), last_slot=self.last_slot)
 
@@ -343,6 +343,8 @@ class Recorder(QtCore.QObject):
             self.int_us = e["int_us"]; return True
         if t == "darks":
             self.darks = e["darks"]; self.counters["dark_sets"] += 1; return True
+        if t == "hot_pixels":
+            self.hot = {k: v for k, v in e.items() if k != "type"}; return True
         if t == "device":
             self.device = dict(info=e["info"], wavelengths=e["wavelengths"]); self._connecting = False
             print(f"device: {e['info']}", flush=True)

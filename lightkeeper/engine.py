@@ -35,7 +35,7 @@ import h5py
 import numpy as np
 
 from . import VERSION
-from . import clock
+from . import clock, hotpix
 from .devices import SIM_ID, OceanDevice, SimDevice, open_by_serial
 from .procs import read_json, write_json_atomic
 from .schedule import SETUP_FIELDS, RunPlan, burst_times, dark_scan_count, ladder_us, sun_events
@@ -239,6 +239,7 @@ class Engine(threading.Thread):
             self.set_state("DISCONNECTED"); return
         self.conn = (self.dev.serial, edc, nlc)
         self.emit("device", info=self.dev.info(), wavelengths=self.dev.wavelengths.copy())
+        self._emit_saved_hot()
         self.set_state("IDLE", "connected")
 
     def _c_connect_serial(self, serial, edc=True, nlc=True, hint_id=None):
@@ -257,7 +258,15 @@ class Engine(threading.Thread):
             self.set_state("DISCONNECTED"); return
         self.conn = (self.dev.serial, edc, nlc)
         self.emit("device", info=self.dev.info(), wavelengths=self.dev.wavelengths.copy())
+        self._emit_saved_hot()
         self.set_state("IDLE", "connected")
+
+    def _emit_saved_hot(self):
+        """The last hot/cold pixel list recorded for this spectrometer, so the live view can hide them outside a run."""
+        h = hotpix.load(self.dev.serial)
+        if h and len(self.dev.wavelengths) == int(h.get("pixels", -1)):
+            self.emit("hot_pixels", hot=h.get("hot", []), cold=h.get("cold", []), int_us=h.get("int_us"),
+                      source=f"saved {h.get('saved_local', '')[:16]} ({h.get('label', '')} darks, {h.get('run', '')})")
 
     def _c_disconnect(self):
         if self.state in ("RECORDING", "BURST", "STANDBY", "POST_RUN", "AWAIT_UNCOVER"):
@@ -504,6 +513,10 @@ class Engine(threading.Thread):
         self.darks = self._load_darks(run_dir, self.ctx["dark_sets"])
         if self.darks:
             self.emit("darks", darks={k: v.astype(np.float32) for k, v in self.darks.items()})
+        if meta.get("hot_pixels"):
+            h = meta["hot_pixels"]
+            self.emit("hot_pixels", hot=h.get("hot", []), cold=h.get("cold", []), int_us=(h.get("sets") or [{}])[-1].get("int_us"),
+                      source="dark sets of this run")
         self._set_int(int(st.get("int_us") or plan.int_ms * 1000), "resume")
         phase = st.get("phase")
         ended = phase == "POST_RUN" or any(d.get("label") == "post" for d in self.ctx["dark_sets"])
@@ -535,11 +548,16 @@ class Engine(threading.Thread):
         if self.dev.simulated:
             self.dev.mode = "dark"
         total = sum(dark_scan_count(u, c["plan"].dark_s_per_int) for u in lad); done = 0
+        longest, longest_us = [], 0
         for us in lad:
             got = self._set_int(us, "dark set", log=False)
             n = dark_scan_count(got, c["plan"].dark_s_per_int); acc = 0
+            if us == max(lad):
+                longest, longest_us = [], got
             for _ in range(n):
                 y = self._scan(); acc = acc + y; done += 1
+                if us == max(lad):
+                    longest.append(y)
                 c["writer"].add("dark_scans", dict(t_wall_ns=np.int64(wall_ns()), int_us=np.int32(got), session=np.int32(sid),
                                                    label=label, spectrum=y.astype(np.float32)))
                 self.emit_scan(y)
@@ -553,7 +571,30 @@ class Engine(threading.Thread):
         if label == "pre":
             c["pre_done"] = True
         self.log("dark_end", f"session {sid} ({label}), {done} scans")
+        if longest:
+            self._hot_from_darks(sid, label, longest, int(longest_us))
         self._set_int(restore, "after darks", log=False)
+
+    def _hot_from_darks(self, sid, label, scans, int_us):
+        """Hot/cold pixels from one dark set; the run keeps the union over its sets (metadata only, raw data untouched)."""
+        c = self.ctx
+        try:
+            hot, cold = hotpix.find(scans)
+        except Exception as e:
+            self.emit("error", text=f"hot-pixel search failed: {e!r}"); return
+        h = c["meta"].setdefault("hot_pixels", dict(method=hotpix.METHOD, k=hotpix.K, min_fraction=hotpix.MIN_FRACTION,
+                                                     window_px=hotpix.WINDOW, sets=[], hot=[], cold=[]))
+        h["sets"].append(dict(session=sid, label=label, int_us=int_us, n_scans=len(scans), hot=hot, cold=cold))
+        h["hot"] = sorted(set(h["hot"]) | set(hot)); h["cold"] = sorted(set(h["cold"]) | set(cold))
+        (c["dir"] / "run_metadata.json").write_text(json.dumps(c["meta"], indent=1, default=str))
+        c["writer"].set_attrs(hot_pixels=h["hot"], cold_pixels=h["cold"])
+        hotpix.save(self.dev.serial, dict(hot=hot, cold=cold, int_us=int_us, n_scans=len(scans), label=label,
+                                          run=c["dir"].name, pixels=len(self.dev.wavelengths), k=hotpix.K,
+                                          min_fraction=hotpix.MIN_FRACTION))
+        wl = self.dev.wavelengths
+        self.log("hot_pixels", f"{label} darks at {int_us / 1000:g} ms: {len(hot)} hot, {len(cold)} cold; hot at "
+                               + ", ".join(f"{wl[i]:.1f}" for i in hot[:40]) + " nm")
+        self.emit("hot_pixels", hot=h["hot"], cold=h["cold"], int_us=int_us, source=f"{label}-run darks of this run")
 
     # ---------------------------------------------------------------- recording
     def _begin_recording(self):

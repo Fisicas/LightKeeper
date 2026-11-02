@@ -20,6 +20,7 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
   smoothed or resampled.
 - **Dark sets you can trust.** Before and after the run, LightKeeper records darks at every rung of the
   integration-time ladder. Auto-exposure moves only along that ladder, so every recorded slot has a matching dark.
+  Each dark set also lists the detector's hot and cold pixels, which the display hides; the raw data keep them.
 - **Sun-event scheduling.** Start and stop can be tied to astronomical, nautical or civil dawn and dusk, or to sunrise
   and sunset, each with an offset. The NOAA/Meeus solar position is used. Times are fixed when you press Start, and
   daylight-saving changes during a run are handled.

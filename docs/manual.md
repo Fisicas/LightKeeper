@@ -99,6 +99,15 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
 - **Setup and clock:** `run_metadata.json` and every HDF5 file carry the setup fields (fiber, diffuser, view
   azimuth/elevation, window, site altitude), `format_version` (2; files without it are format 1) and the SNTP clock
   checks (`clock_offset_s`, `clock_rtt_s`, `clock_checks`). An optional setup photo is copied to `setup_photo.<ext>`.
+- **Hot and cold pixels:** after each dark set, LightKeeper looks at the individual scans at the longest integration time.
+  A pixel is listed when it sits more than 5 robust sigma above (hot) or below (cold) a 15-pixel running median in at
+  least 80 % of those scans. Noise rarely repeats from scan to scan, so the list holds pixels that belong to the detector.
+  - The run keeps the union over its dark sets: `hot_pixels` in `run_metadata.json` (with each set's own list and the
+    method) and `hot_pixels` / `cold_pixels` attributes (pixel indices) on every HDF5 file.
+  - The latest list for each spectrometer is kept in `%LOCALAPPDATA%\LightKeeper\detector\<serial>.json`, so the live
+    view hides those pixels outside a run as well.
+  - The list is metadata only: raw spectra are never altered. **Display → Hide hot and cold pixels** (on by default)
+    bridges them in the live scan, the recent slots and the waterfall.
 - **Crash safety:** a file is opened only during its 30 s flush, so a crash loses at most that buffer.
 - **Sleep:** Windows sleep is blocked while a run is active.
 
@@ -133,7 +142,8 @@ the source and are not comparable between species; they are used only to select 
   - calibration recovery of a deliberate axis error to < 0.01 nm;
   - the plan estimate;
   - the SNTP clock check, with a mocked socket;
-  - the 2026 daylight-saving change.
+  - the 2026 daylight-saving change;
+  - hot-pixel detection from the dark sets, and the saved list on the next connection.
 - **GUI checks**, run off-screen with `QT_QPA_PLATFORM=offscreen`:
   - `tests/gui_recorder_smoke.py`: window close and re-attach, y-scaling and recorder kill.
   - `tests/gui_schedule_running.py`: the Schedule tab during a run.
