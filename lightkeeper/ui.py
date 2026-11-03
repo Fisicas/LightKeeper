@@ -825,14 +825,26 @@ class Window(Q.QMainWindow):
             y = y * 1e6 / us
         x = self._x()
         t = local_dt(int(self.latest_t)) if self.latest_t else dt.datetime.now(LOCAL_TZ)
-        label = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.label_edit.text().strip()).strip("_")
-        stem = f"{label}_{t:%Y-%m-%d_%H-%M-%S}" if label else f"{t:%Y-%m-%d_%H-%M-%S}"
-        folder = Path(self.out_edit.text()).parent / "spectra"
+        # 0.3.10: <scan time>_<run name as in the header> (its leading date dropped when it repeats the scan's), else the label
+        name = Path(self.run_dir).name if getattr(self, "run_dir", None) else self.label_edit.text().strip()
+        name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_")
+        if name.startswith(f"{t:%Y-%m-%d}_"):
+            name = name[11:]
+        stem = f"{t:%Y-%m-%d_%H-%M-%S}_{name}" if name else f"{t:%Y-%m-%d_%H-%M-%S}"
+        folder = Path(str(self.settings.value("spectra_dir", "")) or
+                      QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.StandardLocation.DocumentsLocation))
+        path = folder / f"{stem}.dpt"; k = 2
+        while path.exists():
+            path = folder / f"{stem}_{k}.dpt"; k += 1
+        if not self.auto_confirm:
+            chosen, _ = Q.QFileDialog.getSaveFileName(self, "Save spectrum as", str(path), "Data point table (*.dpt);;All files (*)")
+            if not chosen:
+                return
+            path = Path(chosen) if Path(chosen).suffix else Path(chosen).with_suffix(".dpt")
+        folder = path.parent
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            path = folder / f"{stem}.dpt"; k = 2
-            while path.exists():
-                path = folder / f"{stem}_{k}.dpt"; k += 1
+            self.settings.setValue("spectra_dir", str(folder))
             plan = self._plan()
             meta = dict(app=f"{APP_NAME} {VERSION}", file=path.name, columns=["wavelength_nm", "counts_per_s" if rate else "counts"],
                         scan_time_local=t.isoformat(), integration_ms=us / 1000, scans_averaged=1,

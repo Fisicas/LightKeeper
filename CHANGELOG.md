@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.10 (2026-11-03)
+- **Save spectrum asks where to save.** The button (and Ctrl+S) opens a Save As dialog. It starts in Documents, then in
+  the folder you last saved to. The suggested name is the scan time followed by the run name shown in the header (its
+  leading date dropped when it repeats the scan's), e.g. `2026-11-03_13-41-46_polystyrene_diffuser_upper_canopy_v01.dpt`;
+  with no run, the label from the setup panel. Cancel saves nothing; a name typed without an extension gets `.dpt`.
+  - **Fix:** spectra used to go, without asking, to a `spectra` folder beside the run output folder, which could be a
+    hidden or temporary location.
+
 ## 0.3.9 (2026-11-03)
 - **Back-off for fixed exposure.** New **Back off** setting (Start dialog, next to Exposure; default 10 ms steps down to
   10 ms, 0 = off). After any slot whose peak reaches 55,000 counts, the next slot runs one step shorter (50 → 40 → 30 →

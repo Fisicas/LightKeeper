@@ -1,6 +1,7 @@
-"""GUI check (0.3.6, header 0.3.7): Save spectrum writes the displayed scan as a two-column .dpt (with # detail lines) plus a .json, named
-from the run label or the scan time. Off-screen, simulator only, temporary LIGHTKEEPER_HOME. Run:
+"""GUI check (0.3.6, header 0.3.7, Save As 0.3.10): Save spectrum writes the displayed scan as a two-column .dpt (with # detail lines)
+plus a .json, named <scan time>_<run name or label>, in the last folder used (Documents the first time; the test sets a temp one). Off-screen, simulator only, temporary LIGHTKEEPER_HOME. Run:
    set QT_QPA_PLATFORM=offscreen & python -X utf8 tests\\gui_save_spectrum.py"""
+import datetime as dt
 import json
 import os
 import sys
@@ -41,15 +42,20 @@ w.engine.send("connect", SIM_ID, True, True); pump(5, lambda: w.state == "IDLE")
 w.exp_mode.setCurrentIndex(1); w.int_spin.setValue(100); w._toggle_preview(); pump(2)
 w.max_spin.setValue(200); w.btn_dark.click(); pump(15, lambda: w.hot is not None and w.state == "PREVIEW"); pump(1)
 w.cb_dark.setChecked(True); pump(0.5)
+w.settings.setValue("spectra_dir", str(HOME / "spectra"))     # never the real Documents folder
 w.label_edit.setText("Hg Ar lamp"); w.btn_save_spec.click()
 w.label_edit.setText(""); w.btn_save_spec.click(); w.btn_save_spec.click()
 
+w.run_dir = str(HOME / f"{dt.date.today():%Y-%m-%d}_upper_canopy_v01"); w.btn_save_spec.click(); w.run_dir = None
+
 files = sorted((HOME / "spectra").glob("*.dpt"))
-check("three .dpt files, each with a .json", len(files) == 3 and all(f.with_suffix(".json").exists() for f in files))
-check("the run label names the file", any(f.name.startswith("Hg_Ar_lamp_") for f in files))
-check("the scan time names the file when there is no label", any(f.name[:4].isdigit() for f in files))
+check("four .dpt files, each with a .json", len(files) == 4 and all(f.with_suffix(".json").exists() for f in files))
+check("every name starts with the scan time", all(f.name[:4].isdigit() and f.name[10] == "_" for f in files))
+check("the label follows the time", any(f.stem.endswith("_Hg_Ar_lamp") for f in files))
+check("the run name follows the time, without repeating the date", any(f.stem.endswith("_upper_canopy_v01") and f.stem.count(
+      f"{dt.date.today():%Y-%m-%d}") == 1 for f in files))
 check("a second save in the same second gets _2", any(f.stem.endswith("_2") for f in files))
-f = next(f for f in files if f.name.startswith("Hg_Ar"))
+f = next(f for f in files if f.stem.endswith("_Hg_Ar_lamp"))
 lines = f.read_text(encoding="utf-8").splitlines()
 check("the .dpt starts with # detail lines", lines[0].startswith("# LightKeeper") and any(l.startswith("# scan ") for l in lines))
 rows = [line.split(",") for line in lines if not line.startswith("#")]
