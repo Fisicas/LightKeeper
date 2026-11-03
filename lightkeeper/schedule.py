@@ -56,6 +56,8 @@ class RunPlan:
     burst_s: float = 120.0
     burst_max_int_ms: float = 50.0   # 0.3.8: the burst's own integration time (never snapped onto the slot ladder)
     long_dark_ms: float = 3000.0     # 0.3.8: fixed exposure also takes darks here, so the dark model has two times
+    backoff_step_ms: float = 0.0     # 0.3.9: fixed exposure steps down by this much after a saturated slot (0 = off)...
+    backoff_min_ms: float = 10.0     # ...but never below this, and steps back up towards int_ms when the light allows
     dark_s_per_int: float = 5.0
     pre_darks: bool = True
     post_darks: bool = True
@@ -117,9 +119,14 @@ def _clamp_us(ms: float, dev_min_us: int, dev_max_us: int) -> int:
 
 
 def ladder_us(plan: RunPlan, dev_min_us: int, dev_max_us: int) -> list[int]:
-    """Integration times the recording may use: the ladder within min..max (automatic), or the one fixed time."""
+    """Integration times the recording may use: the ladder within min..max (automatic), or the fixed time and, with
+    back-off, the steps below it down to backoff_min_ms."""
     if not plan.auto_exposure:
-        return [_clamp_us(plan.int_ms, dev_min_us, dev_max_us)]
+        top = _clamp_us(plan.int_ms, dev_min_us, dev_max_us)
+        if plan.backoff_step_ms <= 0:
+            return [top]
+        step = int(round(plan.backoff_step_ms * 1000)); lo = max(dev_min_us, int(round(plan.backoff_min_ms * 1000)))
+        return sorted({top} | set(range(top - step, lo - 1, -step)))
     lo = max(dev_min_us, int(plan.min_int_ms * 1000)); hi = min(dev_max_us, int(plan.max_int_ms * 1000))
     vals = sorted({int(round(x * 1000)) for x in plan.ladder_ms if lo <= x * 1000 <= hi})
     return vals or [lo]

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.9 (2026-11-03)
+- **Back-off for fixed exposure.** New **Back off** setting (Start dialog, next to Exposure; default 10 ms steps down to
+  10 ms, 0 = off). After any slot whose peak reaches 55,000 counts, the next slot runs one step shorter (50 → 40 → 30 →
+  20 → 10 ms, one step per 1 s slot). After 30 slots in a row that would stay under 40,000 counts at the next longer
+  time, it steps back up, never above the fixed time. Every step is in the dark ladder, so the post-run darks cover it.
+  `run_metadata.json` records the settings under `backoff`; `run_summary.json` reports the mode as "fixed with back-off".
+- **Tabs no longer move.** The Time range bar (Waterfall, Time series) now sits under the tab strip, inside the page,
+  instead of above the tabs, so switching tabs never shifts them.
+- **Resume picks up an amended plan.** If a run's plan in `run_metadata.json` was changed while it was interrupted (for
+  example back-off added), resume widens the integration-time and dark ladders and logs `plan_amended`.
+
 ## 0.3.8 (2026-11-02)
 - **Fixed exposure by default.** A run records at a fixed 500 ms unless **Exposure** is set to **Automatic** (which
   moves along the ladder within the **Auto range**, unchanged for now). The run's exposure is now its own setting:

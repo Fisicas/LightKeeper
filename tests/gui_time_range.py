@@ -87,6 +87,21 @@ w.tabs.setCurrentIndex(1); pump(0.3)
 check("the range bar shows on the Waterfall tab", w.range_bar.isVisible())
 w.tabs.setCurrentIndex(0); pump(0.3)
 check("and hides on the Spectrum tab", not w.range_bar.isVisible())
+# 0.3.9: the bar sits under the tab strip, inside the page, so switching tabs never moves the tabs
+bar_y = {}
+for i in range(w.tabs.count()):
+    w.tabs.setCurrentIndex(i); pump(0.3)
+    bar_y[w.tabs.tabText(i)] = w.tabs.tabBar().mapTo(w, w.tabs.tabBar().rect().topLeft()).y()
+check("the tabs stay put on every tab", len(set(bar_y.values())) == 1, bar_y)
+for name in ("Waterfall", "Time series"):
+    w.tabs.setCurrentIndex([w.tabs.tabText(i) for i in range(w.tabs.count())].index(name)); pump(0.3)
+    tb = w.tabs.tabBar(); below = w.range_bar.mapTo(w, w.range_bar.rect().topLeft()).y() >= tb.mapTo(w, tb.rect().bottomLeft()).y()
+    check(f"on {name} the range bar is under the tabs, inside the page", w.range_bar.isVisible() and below
+          and w.range_bar.parent() is w.tabs.currentWidget())
+w.tabs.setCurrentIndex(1); pump(0.5)
+check("the waterfall still draws with the bar moved", len(w.c_wf.ax[0].images) > 0)
+w.grab().save(str(HOME / "waterfall_tabs_fixed_v01.png"))
+w.tabs.setCurrentIndex(0); pump(0.3)
 w._close_recorded_run(); pump(0.3)
 check("closing the recorded run clears the graphs", w.viewing is None and not w.slots)
 after = {p.name: hashlib.md5(p.read_bytes()).hexdigest() for p in sorted(run.iterdir()) if p.is_file()}

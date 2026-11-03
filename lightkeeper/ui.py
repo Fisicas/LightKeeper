@@ -167,6 +167,10 @@ class DateTimeEdit(Q.QDateTimeEdit):
             ev.ignore()
 
 
+def _backoff_txt(plan) -> str:
+    return f", backing off in {plan.backoff_step_ms:g} ms steps to {plan.backoff_min_ms:g} ms" if plan.backoff_step_ms > 0 else ""
+
+
 def site_text(lat, lon) -> str:
     return f"{abs(lat):.4f}° {'N' if lat >= 0 else 'S'}, {abs(lon):.4f}° {'E' if lon >= 0 else 'W'}"
 
@@ -232,10 +236,10 @@ class Window(Q.QMainWindow):
         body = Q.QHBoxLayout(); body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0); v.addLayout(body, 1)
         self.setup = self._left(); body.addWidget(self.setup)
         right = Q.QWidget(); rv = Q.QVBoxLayout(right); rv.setContentsMargins(12, 6, 12, 0); rv.setSpacing(0)
-        self.range_bar = self._range_bar(); rv.addWidget(self.range_bar)
+        self.range_bar = self._range_bar()
         self.tabs = Q.QTabWidget(); self.tabs.setDocumentMode(True); rv.addWidget(self.tabs); body.addWidget(right, 1)
         self._tab_spectrum(); self._tab_waterfall(); self._tab_timeseries(); self._tab_schedule(); self._tab_calibration(); self._tab_events()
-        self.tabs.currentChanged.connect(lambda i: self.range_bar.setVisible(self.tabs.tabText(i) in ("Waterfall", "Time series")))
+        self.tabs.currentChanged.connect(self._place_range_bar)
         self.range_bar.setVisible(False)
         self.progress = Q.QProgressBar(); self.progress.setMaximumWidth(260); self.progress.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress)
@@ -245,6 +249,16 @@ class Window(Q.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self._save_spectrum)
         self._set_setup_visible(self.settings.value("setup_visible", True, type=bool), remember=False)
         self._set_state("DISCONNECTED")
+
+    def _place_range_bar(self, i):
+        """The time-range bar sits at the top of the Waterfall or Time series page, under the tab strip, so the tabs never move."""
+        page = self.tabs.widget(i)
+        if self.tabs.tabText(i) in ("Waterfall", "Time series"):
+            if self.range_bar.parent() is not page:
+                page.layout().insertWidget(0, self.range_bar)
+            self.range_bar.setVisible(True)
+        else:
+            self.range_bar.setVisible(False)
 
     def _range_bar(self):
         """Time range for the Waterfall and Time series tabs: the usable daylight (found automatically), all data, or custom."""
@@ -504,6 +518,13 @@ class Window(Q.QMainWindow):
         f.addRow("Auto range", self.auto_range_row)
         self.run_exp.currentIndexChanged.connect(lambda i: self.auto_range_row.setEnabled(i == 1))
         self.auto_range_row.setEnabled(False)
+        self.backoff_step = dspin(0, 1000, 10, 0, 5, "ms"); self.backoff_min = dspin(1, 60000, 10, 0, 5, "ms")
+        self.backoff_step.setToolTip("Fixed exposure: after a slot that reaches 55,000 counts, step the integration time down by "
+                                     "this much (down to the floor), and back up towards the fixed time after 30 s that would stay "
+                                     "under 40,000 counts. Every step gets a dark set. 0 = off.")
+        self.backoff_row = hbox(self.backoff_step, "steps down to", self.backoff_min, stretch_first=False)
+        f.addRow("Back off", self.backoff_row)
+        self.run_exp.currentIndexChanged.connect(lambda i: self.backoff_row.setEnabled(i == 0))
         self.burst_every = dspin(0, 1440, 60, 0, 15, "min"); self.burst_off = dspin(0, 1439, 30, 0, 5, "min")
         self.burst_every.setToolTip("0 = no bursts")
         f.addRow("Burst every", hbox(self.burst_every, "at minute", self.burst_off, stretch_first=False))
@@ -564,7 +585,7 @@ class Window(Q.QMainWindow):
         for wdg in (self.start_edit, self.stop_edit):
             wdg.dateTimeChanged.connect(self._update_schedule)
         for wdg in (self.slot_spin, self.min_spin, self.max_spin, self.burst_every, self.burst_off, self.burst_s, self.burst_int, self.dark_s,
-                    self.run_int, self.long_dark):
+                    self.run_int, self.long_dark, self.backoff_step, self.backoff_min):
             wdg.valueChanged.connect(self._update_schedule)
         self.run_exp.currentIndexChanged.connect(self._update_schedule)
         for wdg in (self.cb_sd, self.cb_pre, self.cb_post):
@@ -867,7 +888,7 @@ class Window(Q.QMainWindow):
             out.append(("warn", f"Automatic exposure over {', '.join(f'{x:g}' for x in e['ladder_ms'])} ms: each change can step "
                                 "the band depths (handoff B2/B3). Fixed exposure avoids it."))
         else:
-            out.append(("ok", f"Fixed exposure at {e['ladder_ms'][0]:g} ms"))
+            out.append(("ok", f"Fixed exposure at {plan.int_ms:g} ms" + _backoff_txt(plan)))
         if e["bursts"]:
             lvl = "warn" if e["burst_int_ms"] > e["ladder_ms"][0] else "ok"
             out.append((lvl, f"{len(e['bursts'])} bursts at {e['burst_int_ms']:g} ms, with their own {e['burst_int_ms']:g} ms dark"
@@ -953,7 +974,7 @@ class Window(Q.QMainWindow):
                        start_local=self.start_edit.dateTime().toPython().replace(tzinfo=LOCAL_TZ).isoformat(),
                        stop_local=self.stop_edit.dateTime().toPython().replace(tzinfo=LOCAL_TZ).isoformat(),
                        slot_s=self.slot_spin.value(), auto_exposure=self.run_exp.currentIndex() == 1, int_ms=self.run_int.value(),
-                       long_dark_ms=self.long_dark.value(),
+                       long_dark_ms=self.long_dark.value(), backoff_step_ms=self.backoff_step.value(), backoff_min_ms=self.backoff_min.value(),
                        min_int_ms=self.min_spin.value(), max_int_ms=self.max_spin.value(), ladder_ms=ladder,
                        edc=self.cb_edc.isChecked(), nlc=self.cb_nlc.isChecked(), store_sd=self.cb_sd.isChecked(),
                        burst_every_min=self.burst_every.value(), burst_offset_min=self.burst_off.value(), burst_s=self.burst_s.value(),
@@ -994,7 +1015,7 @@ class Window(Q.QMainWindow):
                f"{'Stop event: ' + plan.stop_event + f' {plan.stop_offset_min:+g} min' + chr(10) if plan.stop_event else ''}"
                f"Stop: {e['stop']:%Y-%m-%d %H:%M}  ({e['duration_h']:.2f} h, {e['slots']:,} slots of {plan.slot_s:g} s)\n"
                f"Bursts: {len(e['bursts'])} × {plan.burst_s:g} s at {e['burst_int_ms']:g} ms\n"
-               f"Exposure: {'automatic, ' + ', '.join(f'{x:g}' for x in e['ladder_ms']) + ' ms' if plan.auto_exposure else 'fixed at ' + format(e['ladder_ms'][0], 'g') + ' ms'}\n"
+               f"Exposure: {'automatic, ' + ', '.join(f'{x:g}' for x in e['ladder_ms']) + ' ms' if plan.auto_exposure else 'fixed at ' + format(plan.int_ms, 'g') + ' ms' + _backoff_txt(plan)}\n"
                f"Dark sets: {'pre ' if plan.pre_darks else ''}{'post' if plan.post_darks else ''} · ~{e['dark_session_s']:.0f} s each at {', '.join(f'{x:g}' for x in e['dark_ladder_ms'])} ms\n"
                f"Estimated data: {e['data_gb_uncompressed']:.2f} GB (free {e['disk_free_gb']:.0f} GB)")
         checks = self._preflight(plan, e)
@@ -1638,7 +1659,7 @@ class Window(Q.QMainWindow):
         bursts = ", ".join(f"{b:%H:%M}" for b in e["bursts"])
         rows = [("Start", start_txt), ("Stop", stop_txt), ("Duration", f"{e['duration_h']:.2f} h, {e['slots']:,} slots of {plan.slot_s:g} s"),
                 ("Exposure", f"Automatic, {', '.join(f'{x:g}' for x in e['ladder_ms'])} ms, starting at {plan.int_ms:g} ms"
-                             if plan.auto_exposure else f"Fixed at {e['ladder_ms'][0]:g} ms"),
+                             if plan.auto_exposure else f"Fixed at {plan.int_ms:g} ms" + _backoff_txt(plan)),
                 ("Dark times", f"{', '.join(f'{x:g}' for x in e['dark_ladder_ms'])} ms"),
                 ("Dark sets", f"{' and '.join(x for x, on in (('before', plan.pre_darks), ('after', plan.post_darks)) if on) or 'none'}, "
                               f"about {e['dark_session_s']:.0f} s each ({e['dark_scans_total']:,} scans)"),

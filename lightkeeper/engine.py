@@ -46,11 +46,19 @@ STEP_DOWN_MAX = 55000.0
 TARGET_HIGH = 40000.0
 LOW_P995 = 15000.0
 N_LOW = 10
+BACKOFF_UP_SLOTS = 30          # 0.3.9: slots in a row that must fit under TARGET_HIGH at the next longer time
 AE_WINDOW_NM = (400.0, 1050.0)
 DISCARD = 2
 FORMAT_VERSION = 2               # 0.3.1: HDF5/run_metadata format; 0.1.0 files have no attribute = format 1
 CLOCK_EVERY_NS = 3600 * 10 ** 9
 BURST_MIN_FILL = 0.01             # skip a burst whose predicted p99.5 is below this fraction of SAT_LEVEL
+
+
+def _backoff_meta(plan):
+    if plan.auto_exposure or plan.backoff_step_ms <= 0:
+        return None
+    return dict(step_ms=plan.backoff_step_ms, min_ms=plan.backoff_min_ms, from_ms=plan.int_ms, step_down_at=STEP_DOWN_MAX,
+                step_up_below=TARGET_HIGH, step_up_after_slots=BACKOFF_UP_SLOTS)
 
 
 def despiked(y):
@@ -82,6 +90,7 @@ class Engine(threading.Thread):
         self.dev = None
         self.state = "DISCONNECTED"
         self.auto = True
+        self.backoff = False     # 0.3.9: fixed exposure with back-off (set per run)
         self.low_count = 0
         self.darks: dict[int, np.ndarray] = {}
         self._quit = False
@@ -220,6 +229,23 @@ class Engine(threading.Thread):
                 if ok:
                     self._set_int(lad[max(ok)], f"p99.5 {p995:.0f}, peak {bmax:.0f} counts")
                 self.low_count = 0
+        else:
+            self.low_count = 0
+
+    def _backoff(self, bmax):
+        """Fixed exposure with back-off (0.3.9): one step down right after a slot that reaches STEP_DOWN_MAX, one step back up
+        (never above the run's fixed time) after BACKOFF_UP_SLOTS slots in a row that would stay under TARGET_HIGH there."""
+        lad = self.ctx["ladder"]; cur = self.dev.int_us
+        lower = [v for v in lad if v < cur]; higher = [v for v in lad if v > cur]
+        if bmax >= STEP_DOWN_MAX:
+            self.low_count = 0
+            if lower:
+                self._set_int(max(lower), f"back-off, peak {bmax:.0f} counts")
+        elif higher and bmax * min(higher) / cur <= TARGET_HIGH:
+            self.low_count += 1
+            if self.low_count >= BACKOFF_UP_SLOTS:
+                self.low_count = 0
+                self._set_int(min(higher), f"back-off released, peak {bmax:.0f} counts")
         else:
             self.low_count = 0
 
@@ -385,6 +411,7 @@ class Engine(threading.Thread):
                     time_sync_status=time_sync_status(), format_version=FORMAT_VERSION,
                     auto_exposure=dict(step_down_above=STEP_DOWN_MAX, target_high=TARGET_HIGH, low_p995=LOW_P995,
                                        n_low_slots=N_LOW, window_nm=AE_WINDOW_NM, discard_after_change=DISCARD),
+                    backoff=_backoff_meta(plan),
                     saturation_level_counts=SAT_LEVEL,
                     exposure_timing_note="Maya2000Pro benchmark 2026-10-31: scan period = integration time (no dead time); "
                                          "each scan timestamp is the host time at return = end of that exposure")
@@ -405,6 +432,7 @@ class Engine(threading.Thread):
                         dark_session=0, bursts=burst_times(plan, t_start, t_stop), stop_req=False,
                         segment=0, dark_sets=[], pre_done=False, last_slot_ns=None, uncovered=False, temp=bool(temp_src))
         self.auto = plan.auto_exposure
+        self.backoff = _backoff_meta(plan) is not None; self.low_count = 0
         self.emit("run", dir=str(run_dir), plan=plan.to_dict(), ladder_us=lad, t_start=t_start.isoformat(), t_stop=t_stop.isoformat())
         self.log("run_created", f"{run_dir}")
         if str(meta.get("setup_photo_copy", "")).startswith("failed"):
@@ -534,7 +562,11 @@ class Engine(threading.Thread):
             self.emit("resume_refused", text=f"{run_dir.name} is already closed"); return
         plan = RunPlan.from_dict(meta["plan"])
         t_start = dt.datetime.fromisoformat(meta["planned_start_local"]); t_stop = dt.datetime.fromisoformat(meta["planned_stop_local"])
-        info = self.dev.info(); lad = [int(u) for u in meta["ladder_us"]]
+        info = self.dev.info()
+        lad = sorted({int(u) for u in meta["ladder_us"]} | set(ladder_us(plan, self.dev.min_us, self.dev.max_us)))
+        dl = sorted({int(u) for u in meta.get("dark_ladder_us", meta["ladder_us"])} | set(dark_ladder_us(plan, self.dev.min_us, self.dev.max_us)))
+        widened = lad != [int(u) for u in meta["ladder_us"]]
+        meta.update(ladder_us=lad, dark_ladder_us=dl, backoff=_backoff_meta(plan))
         if str(info.get("serial")) != str(meta.get("device", {}).get("serial")):
             self.emit("error", text=f"resume: device serial {info.get('serial')} differs from the run's {meta['device'].get('serial')}")
         attrs = dict(app=meta["app"], serial=info.get("serial", ""), model=info.get("model", ""), label=plan.label,
@@ -549,7 +581,7 @@ class Engine(threading.Thread):
         gap_s = (wall_ns() - int(last)) / 1e9 if last else None
         self.ctx = dict(plan=plan, dir=run_dir, meta=meta, events=Events(run_dir / "events.csv"), writer=w,
                         t_start=t_start, t_stop=t_stop, ladder=lad, used_us=set(st.get("used_us", [])),
-                        dark_ladder=[int(u) for u in meta.get("dark_ladder_us", lad)],
+                        dark_ladder=dl,
                         temp=bool(getattr(self.dev, "temperature_source", "")) and "none" not in str(meta.get("temperature_source", "none")),
                         n_slots=int(st.get("n_slots", 0)), n_sat=int(st.get("n_sat", 0)), burst_id=int(st.get("burst_id", 0)),
                         dark_session=int(st.get("dark_session", 0)), bursts=[b for b in burst_times(plan, t_start, t_stop) if b > now],
@@ -560,12 +592,16 @@ class Engine(threading.Thread):
                                                    gap_since_last_slot_s=gap_s, app=f"LightKeeper {VERSION}"))
         (run_dir / "run_metadata.json").write_text(json.dumps(meta, indent=1, default=str))
         self.auto = plan.auto_exposure
+        self.backoff = _backoff_meta(plan) is not None; self.low_count = 0
         self.emit("run", dir=str(run_dir), plan=plan.to_dict(), ladder_us=lad, t_start=t_start.isoformat(), t_stop=t_stop.isoformat(),
                   resumed=True, segment=seg)
         self.log("resumed", f"segment {seg}; previous phase {st.get('phase')} ({st.get('status')}); last slot {st.get('last_slot_local')}"
                             + (f"; gap {gap_s:.0f} s" if gap_s is not None else ""))
         for r in repairs:
             self.log("storage_repair", r)
+        if widened:
+            self.log("plan_amended", f"integration times now {', '.join(f'{u / 1000:g}' for u in lad)} ms; darks at "
+                                     f"{', '.join(f'{u / 1000:g}' for u in dl)} ms")
         prevent_sleep(True)
         self.darks = self._load_darks(run_dir, self.ctx["dark_sets"])
         if self.darks:
@@ -706,6 +742,8 @@ class Engine(threading.Thread):
                   next_burst=c["bursts"][0].isoformat() if c["bursts"] else "")
         if self.auto:
             self._auto_exposure(bmax, p995)
+        elif self.backoff:
+            self._backoff(bmax)
         c["k"] = max(c["k"] + 1, int((mono_ns() - c["m0"]) // c["slot_ns"]))
         if mono_ns() - c.get("clock_m", 0) > CLOCK_EVERY_NS:
             self._clock_check("hourly")

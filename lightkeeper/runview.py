@@ -220,7 +220,7 @@ def summarize(run_dir, meta: dict) -> dict:
         recording=dict(start_local=meta.get("resolved_start_local") or meta.get("planned_start_local"),
                        end_local=meta.get("recording_end_local"), segments=1 + len(meta.get("resumes", []))),
         slots=dict(recorded=int(len(it)), with_saturation=int((nsat > 0).sum())),
-        exposure=dict(mode="automatic" if plan.get("auto_exposure") else "fixed",
+        exposure=dict(mode="automatic" if plan.get("auto_exposure") else "fixed with back-off" if meta.get("backoff") else "fixed",
                       integration_times_ms=sorted({float(u) / 1000 for u in np.unique(it)}) if len(it) else []),
         integration_changes=changes,
         bursts=dict(done=len(bursts), skipped=skipped, int_ms=sorted({b["int_ms"] for b in bursts if b.get("int_ms") is not None}),
