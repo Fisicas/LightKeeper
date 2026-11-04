@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.11 (2026-11-03)
+- **Watchdog.** A hidden scheduled task checks once a minute while a run is open, and resumes the run if its recorder and
+  supervisor have died together. Until now only opening the window or logging on again could do that.
+  - **Why:** on 3 Nov, a Claude desktop update closed a supervisor that had been started from inside Claude, mid-burst.
+  - **It leaves a run alone** if it was interrupted or closed, if the supervisor gave up after repeated crashes, if you
+    answered **Not now** in the window, if it is more than 1 h past its scheduled stop, or while a window has the
+    spectrometer open. The task removes itself when no open run is left.
+  - **Behaviour change:** killing both processes in Task Manager no longer ends a run. Use **Stop** or **Interrupt**.
+- **One supervisor per spectrometer.** A named lock settles a window, the logon entry and the watchdog resuming at once.
+- **A window that lost its recorder** no longer takes the spectrometer for live view while the run can still come back.
+- **Fix: the Start dialog's default back-off at 500 ms.** Back off (0.3.9) defaults to 10 ms steps, which at the default
+  500 ms means 50 integration times: each dark set takes about 4 min, not 26 s, and reaching 10 ms takes 49 s. The
+  pre-flight list now warns about this. At 50 ms it is 5 times, as intended.
+  - **Fix:** with back-off on, a burst at the fixed time was wrongly flagged as longer than the shortest slot time.
+- **Logon entries clean themselves up.** A supervisor refusing a closed run now removes that run's logon entry; a run
+  closed on 3 Nov left one behind, which only caused a harmless refusal at logon. The cause was not found.
+- **Fix: the recorder log was always empty.** Windows reports the supervisor's NUL output as a terminal, so every message
+  was discarded. Messages now reach `logs\recorder_*.log`, and a full disk cannot raise an error from a log message.
+
 ## 0.3.10 (2026-11-03)
 - **Save spectrum asks where to save.** The button (and Ctrl+S) opens a Save As dialog. It starts in Documents, then in
   the folder you last saved to. The suggested name is the scan time followed by the run name shown in the header (its

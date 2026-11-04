@@ -3,6 +3,7 @@
   LightKeeper.py                       the window (attaches to a running background recorder if there is one)
   LightKeeper.py --supervisor ...      background: keeps a run's recorder alive (started by the window / at logon)
   LightKeeper.py --recorder ...        background: the recorder itself (started by the supervisor)
+  LightKeeper.py --watchdog            background: one check that an open run is alive (started by a scheduled task)
 """
 import sys
 from pathlib import Path
@@ -13,6 +14,9 @@ if __name__ == "__main__":
     if "--supervisor" in sys.argv:
         from lightkeeper.supervisor import main as sup_main
         raise SystemExit(sup_main([a for a in sys.argv[1:] if a != "--supervisor"]))
+    if "--watchdog" in sys.argv:
+        from lightkeeper.watchdog import main as dog_main
+        raise SystemExit(dog_main([a for a in sys.argv[1:] if a != "--watchdog"]))
     if "--recorder" in sys.argv:
         from lightkeeper.recorder import main as rec_main
         raise SystemExit(rec_main([a for a in sys.argv[1:] if a != "--recorder"]))

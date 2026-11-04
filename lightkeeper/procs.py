@@ -4,10 +4,13 @@
 * recorder sessions     app_home/recorders/<serial>.json : how a window finds and attaches to a running recorder
 * open-run registry     app_home/open_runs/<run folder name>.json : runs that are not finished (resumable)
 * logon resume          HKCU\\...\\Run value that restarts the supervisor with --resume after a Windows restart
+* watchdog              a scheduled task that resumes an open run whose supervisor and recorder both died (watchdog.py)
 * pid_alive()           NEVER os.kill(pid, 0) on Windows: there it terminates the process.
 """
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
@@ -25,6 +28,8 @@ EXIT_DONE = 0          # run closed normally (or cancelled)
 EXIT_REFUSED = 2       # nothing to do: run already closed, another recorder holds the device, bad arguments
 EXIT_NO_DEVICE = 3     # a NEW run could not open the spectrometer (nothing was created)
 EXIT_INTERRUPTED = 10  # user chose "interrupt, resume later": do not restart
+
+WATCHDOG_GRACE_H = 1.0 # after a run's scheduled stop, the watchdog keeps resuming it this long (for the post-run darks)
 
 
 def app_home() -> Path:
@@ -186,3 +191,124 @@ def set_logon_resume(run_dir: Path, on: bool) -> str:
             return f"logon resume removed (HKCU Run\\{name})"
     except OSError as e:
         return f"logon resume: registry error {e!r}"
+
+
+# ---------------------------------------------------------------- watchdog (0.3.11)
+def watchdog_off(run_dir: Path, why: str) -> None:
+    """The watchdog must leave this run alone until someone resumes it by hand (the supervisor's start clears this)."""
+    write_json_atomic(Path(run_dir) / "watchdog_off.json", dict(why=why, local=dt.datetime.now().astimezone().isoformat(timespec="seconds")))
+
+
+def watchdog_clear(run_dir: Path) -> None:
+    try:
+        (Path(run_dir) / "watchdog_off.json").unlink()
+    except FileNotFoundError:
+        pass
+
+
+def needs_watching(r: dict, now: dt.datetime | None = None) -> bool:
+    """An entry of open_runs() the watchdog should keep alive: open, not switched off, not long past its scheduled stop."""
+    st = r["state"]
+    if st.get("status") != "open" or (Path(r["run_dir"]) / "watchdog_off.json").exists():
+        return False
+    try:
+        stop = dt.datetime.fromisoformat(st["planned_stop_local"]).astimezone()
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (now or dt.datetime.now().astimezone()) <= stop + dt.timedelta(hours=WATCHDOG_GRACE_H)
+
+
+def watched_runs() -> list[dict]:
+    return [r for r in open_runs() if needs_watching(r)]
+
+
+def set_window_holds(on: bool) -> None:
+    """A window says it has the spectrometer open itself; the watchdog must not start a recorder that would fight for it."""
+    f = app_home() / f"window_device_{os.getpid()}.json"
+    if on:
+        write_json_atomic(f, dict(pid=os.getpid()))
+    else:
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def window_holds_device() -> bool:
+    return any(pid_alive((read_json(f) or {}).get("pid")) for f in app_home().glob("window_device_*.json"))
+
+
+_supervisor_lock = None
+
+
+def supervisor_lock(serial: str) -> bool:
+    """One supervisor per spectrometer: a named mutex, which Windows releases however this process ends. Kept for life."""
+    global _supervisor_lock
+    if not IS_WIN:
+        return True
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    tag = hashlib.sha1(f"{app_home()}|{serial}".lower().encode()).hexdigest()[:16]
+    h = k32.CreateMutexW(None, False, f"Local\\LightKeeperSupervisor_{tag}")
+    if not h:
+        return True                                 # no lock available: the session and supervisor.json checks still apply
+    if ctypes.get_last_error() == 183:              # ERROR_ALREADY_EXISTS
+        k32.CloseHandle(h)
+        return False
+    _supervisor_lock = h
+    return True
+
+
+def watchdog_task_name() -> str:
+    home = os.environ.get("LIGHTKEEPER_HOME")
+    return "LightKeeper Watchdog " + hashlib.sha1(home.lower().encode()).hexdigest()[:8] if home else "LightKeeper Watchdog"
+
+
+def _watchdog_xml() -> str:
+    from xml.sax.saxutils import escape
+    home = os.environ.get("LIGHTKEEPER_HOME")
+    exe, *args = entry_args("--watchdog", *(["--home", home] if home else []))
+    arguments = " ".join(f'"{a}"' if " " in a else a for a in args)
+    start = dt.datetime.now().replace(microsecond=0).isoformat()
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Resumes an open LightKeeper run if its recorder and supervisor have died. Removes itself when no run is open.</Description></RegistrationInfo>
+  <Triggers><TimeTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>{start}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>false</StartWhenAvailable><Hidden>true</Hidden><ExecutionTimeLimit>PT5M</ExecutionTimeLimit><Enabled>true</Enabled></Settings>
+  <Actions Context="Author"><Exec><Command>{escape(exe)}</Command><Arguments>{escape(arguments)}</Arguments><WorkingDirectory>{escape(str(ROOT))}</WorkingDirectory></Exec></Actions>
+</Task>
+"""
+
+
+def set_watchdog_task(on: bool) -> str:
+    """Create or remove the scheduled task. Returns a note; a failure never touches the run. A test or portable home
+    (LIGHTKEEPER_HOME) gets a task only when LIGHTKEEPER_WATCHDOG=1 asks for one."""
+    if not IS_WIN:
+        return "watchdog: not Windows, skipped"
+    if os.environ.get("LIGHTKEEPER_HOME") and os.environ.get("LIGHTKEEPER_WATCHDOG") != "1":
+        return "watchdog: skipped for this LIGHTKEEPER_HOME"
+    name = watchdog_task_name()
+    kw = dict(capture_output=True, text=True, timeout=20, creationflags=0x08000000)
+    try:
+        if not on:
+            r = subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"], **kw)
+            return f"watchdog task removed ({name})" if r.returncode == 0 else f"watchdog task: nothing to remove ({name})"
+        xml = app_home() / "watchdog_task.xml"
+        xml.write_text(_watchdog_xml(), encoding="utf-16")
+        try:
+            r = subprocess.run(["schtasks", "/Create", "/TN", name, "/XML", str(xml), "/F"], **kw)
+        finally:
+            xml.unlink(missing_ok=True)
+        return f"watchdog task set ({name})" if r.returncode == 0 else f"watchdog task NOT set: {(r.stderr or r.stdout).strip()}"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"watchdog task: {e!r}"
+
+
+def sync_watchdog() -> str:
+    """After a run closed or was interrupted: the task stays only while another open run needs it."""
+    return "watchdog task kept: another open run" if watched_runs() else set_watchdog_task(False)

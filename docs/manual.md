@@ -175,6 +175,7 @@ the source and are not comparable between species; they are used only to select 
   - `tests/gui_schedule_running.py`: the Schedule tab during a run.
   - `tests/gui_save_spectrum.py`: Save spectrum file names, the two-column `.dpt` and its `.json`.
   - `tests/gui_preflight.py`: the run's own exposure setting and the pre-flight checklist.
+  - `tests/gui_watchdog.py`: the window and the watchdog sharing the spectrometer.
   - `tests/gui_time_range.py [run folder]`: the time range and opening a recorded run read-only (a synthetic day by
     default; give a real run folder to open that one, which is only read).
 - **Hardware:** dawn-to-dusk field runs on a Maya2000 Pro. The scan period equals the integration time from 8 to 500 ms,
@@ -243,6 +244,18 @@ as GammaKeeper's independent recorder).
 - **Crash or kill.** If the recorder dies (native fault, Task Manager, an unhandled error), the supervisor restarts it
   after 5, 10, 20, 40 or 60 s and resumes the run. After more than 6 crashes in 10 min it stops trying, and the run
   stays open for a resume by hand.
+- **Recorder and supervisor die together.** While a run is open, a hidden scheduled task, `LightKeeper Watchdog`, checks
+  once a minute (about 0.1 s of work). If an open run has neither process, it resumes the run; recording is back within
+  about a minute plus the time to open the spectrometer. It removes itself when no open run is left. It runs only while
+  you are logged in. It leaves a run alone if:
+  - the run was interrupted or closed;
+  - the supervisor gave up after repeated crashes;
+  - you answered **Not now** when the window offered to resume it;
+  - the run is more than 1 h past its scheduled stop;
+  - a window has the spectrometer open. A window that lost its recorder leaves the spectrometer free so the run can return.
+
+  To end a run on purpose, use **Stop** or **Interrupt**: killing both processes in Task Manager brings the run back.
+  What it did is in `logs\watchdog_<date>.log`.
 - **USB fault.** After 3 and 5 failed scans the spectrometer is closed and reopened by serial number.
 - **Windows restart.** While a run is open, a per-run entry `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\LightKeeperResume_<run>`
   restarts the supervisor with `--resume` at the next **logon**. Nothing runs before you log in. The entry is removed
@@ -266,13 +279,14 @@ New or changed files in a run folder:
 - `run_state.json`: the run journal (status `open` / `interrupted` / `closed`, phase, segment, last slot, counts,
   dark sets, files), rewritten atomically at every state change and every flush.
 - `supervisor.json`: present while a supervisor looks after the run.
+- `watchdog_off.json`: the watchdog leaves this run alone, and why. The next resume by hand or at logon removes it.
 - `blocks/segment` (int16): 0 for the first stretch of recording, +1 for each resume. `slot_index` restarts in each
   segment; `t_wall_ns` is the time base.
 
 Process files: `%LOCALAPPDATA%\LightKeeper\`, holding:
 - `recorders\<serial>.json`: how a window finds the recorder (pid, local port, key);
 - `open_runs\`;
-- `logs\`: supervisor and recorder logs. A native crash leaves a Python traceback in the recorder log through
+- `logs\`: supervisor, recorder and watchdog logs. A native crash leaves a Python traceback in the recorder log through
   `faulthandler`.
 
 **Spectrum tab y-axis.**

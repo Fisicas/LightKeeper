@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from .procs import (EXIT_DONE, EXIT_INTERRUPTED, EXIT_NO_DEVICE, EXIT_REFUSED, IS_WIN, app_home, entry_args, pid_alive,
-                    read_json, session_path, write_json_atomic)
+                    read_json, session_path, set_logon_resume, supervisor_lock, watchdog_clear, watchdog_off, write_json_atomic)
 
 BACKOFF_S = [5, 10, 20, 40, 60]
 MAX_CRASHES, CRASH_WINDOW_S = 6, 600
@@ -42,6 +42,8 @@ def main(argv=None) -> int:
     if run_dir is not None:
         st = read_json(run_dir / "run_state.json")
         if not st or st.get("status") == "closed":
+            if st:                                       # a closed run needs no logon entry, however one was left behind
+                say(set_logon_resume(run_dir, False))
             say("run closed or unknown; nothing to do"); return EXIT_REFUSED
         serial = serial or st.get("serial", "")
         sup = read_json(run_dir / "supervisor.json")
@@ -50,6 +52,14 @@ def main(argv=None) -> int:
         sess = read_json(session_path(serial))
         if sess and pid_alive(sess.get("pid")):
             say(f"a recorder (pid {sess['pid']}) already holds {serial}"); return EXIT_REFUSED
+    for attempt in range(6 if run_dir is None else 1):   # a new run may start just as the last run's supervisor is ending
+        if supervisor_lock(serial):
+            break
+        time.sleep(0.5)
+    else:
+        say(f"another supervisor already looks after {serial}"); return EXIT_REFUSED
+    if run_dir is not None:
+        watchdog_clear(run_dir)                          # a resume by hand or by the logon entry switches the watchdog back on
     env = dict(os.environ, LIGHTKEEPER_SUPERVISOR_PID=str(os.getpid()))
     child_args = [a for a in argv]
     crashes: list[float] = []
@@ -76,7 +86,8 @@ def main(argv=None) -> int:
             say("run status", st.get("status"), "- not restarting"); break
         now = time.time(); crashes = [t for t in crashes if now - t < CRASH_WINDOW_S] + [now]
         if len(crashes) > MAX_CRASHES:
-            say(f"{len(crashes)} crashes in {CRASH_WINDOW_S} s - giving up; resume by hand from the window"); break
+            say(f"{len(crashes)} crashes in {CRASH_WINDOW_S} s - giving up; resume by hand from the window")
+            watchdog_off(run_dir, f"supervisor gave up after {len(crashes)} crashes in {CRASH_WINDOW_S} s"); break
         wait = BACKOFF_S[min(k, len(BACKOFF_S) - 1)]; k += 1
         say(f"recorder crashed; resuming {run_dir} in {wait} s")
         time.sleep(wait)

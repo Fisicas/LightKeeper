@@ -36,7 +36,8 @@ from .engine import Engine
 from .icons import state_icon
 from .link import RUN_COMMANDS
 from .procs import (EXIT_DONE, EXIT_INTERRUPTED, EXIT_NO_DEVICE, EXIT_REFUSED, app_home, entry_args, pid_alive, read_json,
-                    register_open_run, session_path, set_logon_resume, spawn_detached, unregister_open_run, write_json_atomic)
+                    register_open_run, session_path, set_logon_resume, set_watchdog_task, spawn_detached, sync_watchdog,
+                    unregister_open_run, write_json_atomic)
 from .schedule import RunPlan
 from .storage import LOCAL_TZ
 
@@ -47,6 +48,40 @@ LABELS = {"RECORDING": "recording", "BURST": "fast burst", "STANDBY": "armed, wa
           "DARK": "dark set (input covered)", "AWAIT_UNCOVER": "waiting: uncover the input, then Continue",
           "POST_RUN": "recording finished: post-run darks needed", "WAITING_DEVICE": "waiting for the spectrometer",
           "PREVIEW": "closing", "IDLE": "connected", "DISCONNECTED": "starting"}
+
+
+def _has_console(stream) -> bool:
+    """isatty() alone is not enough on Windows: it is also true of NUL, which is what the supervisor gives the recorder."""
+    try:
+        if stream is None or not stream.isatty():
+            return False
+        if sys.platform.startswith("win"):
+            import ctypes
+            import msvcrt
+            mode = ctypes.c_ulong()
+            return bool(ctypes.windll.kernel32.GetConsoleMode(ctypes.c_void_p(msvcrt.get_osfhandle(stream.fileno())), ctypes.byref(mode)))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+class _QuietLog:
+    """print() to the log file; a full disk must not raise inside the recorder for the sake of a message."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def write(self, s):
+        try:
+            return self.f.write(s)
+        except (OSError, ValueError):
+            return 0
+
+    def flush(self):
+        try:
+            self.f.flush()
+        except (OSError, ValueError):
+            pass
 
 
 class Hub:
@@ -404,6 +439,8 @@ class Recorder(QtCore.QObject):
             plan = RunPlan.from_dict(e["plan"])
             note = set_logon_resume(self.run_dir, bool(getattr(plan, "auto_resume_logon", True)))
             print(note, flush=True); self.logs.append(note)
+            note = set_watchdog_task(True)
+            print(note, flush=True); self.logs.append(note)
             if e.get("resumed"):
                 self._note("Run resumed", f"{self.run_dir.name}: continuing as segment {e.get('segment')}.", "info")
             self._refresh_tray()
@@ -414,6 +451,7 @@ class Recorder(QtCore.QObject):
                 set_logon_resume(self.run_dir, False)
                 if closed:
                     unregister_open_run(self.run_dir)
+            print(sync_watchdog(), flush=True)
             self._note("Run closed" if closed else "Run interrupted",
                        f"{self.run_dir.name if self.run_dir else ''}\n" + ("All data saved; spectrometer released." if closed else
                                                                            "Data saved. Resume it from the LightKeeper window."))
@@ -459,8 +497,8 @@ def main(argv=None) -> int:
         print("give exactly one of --plan or --resume"); return EXIT_REFUSED
     home = app_home()
     log = open(home / "logs" / f"recorder_{dt.datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}.log", "a", buffering=1, encoding="utf-8")
-    if sys.stdout is None or not sys.stdout.isatty():
-        sys.stdout = sys.stderr = log
+    if not _has_console(sys.stdout):               # 0.3.11: under the supervisor every message used to go to NUL
+        sys.stdout = sys.stderr = _QuietLog(log)
     faulthandler.enable(log)                       # native crashes (e.g. in the vendor SDK) leave a traceback here
     print(f"LightKeeper recorder {VERSION} pid {os.getpid()} args {argv}", flush=True)
     if args.resume:

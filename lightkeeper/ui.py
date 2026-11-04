@@ -35,7 +35,8 @@ from . import clock  # noqa: E402
 from .engine import SAT_LEVEL, Engine  # noqa: E402
 from .icons import ICON_SVG, icon  # noqa: E402,F401
 from .link import RecorderLink  # noqa: E402
-from .procs import (app_home, entry_args, live_sessions, open_runs, read_json, spawn_detached, supervisor_alive,  # noqa: E402
+from .procs import (app_home, entry_args, live_sessions, needs_watching, open_runs, read_json, set_window_holds, spawn_detached,  # noqa: E402
+                    supervisor_alive, watched_runs, watchdog_off,  # noqa: E402
                     write_json_atomic)
 from .schedule import SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, solar_day, sun_events  # noqa: E402
 from .storage import LOCAL_TZ, local_dt  # noqa: E402
@@ -166,6 +167,8 @@ class DateTimeEdit(Q.QDateTimeEdit):
         else:
             ev.ignore()
 
+BACKOFF_MANY = 10    # more integration times than this under back-off: the pre-flight list says what that costs
+
 
 def _backoff_txt(plan) -> str:
     return f", backing off in {plan.backoff_step_ms:g} ms steps to {plan.backoff_min_ms:g} ms" if plan.backoff_step_ms > 0 else ""
@@ -209,7 +212,7 @@ class Window(Q.QMainWindow):
             self.settings = QtCore.QSettings(str(app_home() / "settings.ini"), QtCore.QSettings.Format.IniFormat)
         else:
             self.settings = QtCore.QSettings("LightKeeper", "LightKeeper")
-        self.engine = Engine(); self.engine.start()
+        self.engine = Engine(); self.engine.start(); self._holds_device = False
         self.state = "DISCONNECTED"; self.info = {}; self.wl_dev = None; self.axis = None; self.axis_label = "device axis"
         self.latest = None; self.latest_int = None; self.latest_t = None; self.darks = {}; self.valid = None; self.hot = None
         self.slots = []; self.spectra = []; self.spec_stride = 1; self._slot_count = 0; self._dirty_ts = False
@@ -901,8 +904,12 @@ class Window(Q.QMainWindow):
                                 "the band depths (handoff B2/B3). Fixed exposure avoids it."))
         else:
             out.append(("ok", f"Fixed exposure at {plan.int_ms:g} ms" + _backoff_txt(plan)))
+            if len(e["ladder_ms"]) > BACKOFF_MANY:   # 0.3.11: each step needs a dark, and it steps once per slot
+                out.append(("warn", f"Back off makes {len(e['ladder_ms'])} integration times: each dark set takes about "
+                                    f"{e['dark_session_s']:.0f} s, and reaching {plan.backoff_min_ms:g} ms takes "
+                                    f"{(len(e['ladder_ms']) - 1) * plan.slot_s:.0f} s. Use a larger step or a shorter exposure."))
         if e["bursts"]:
-            lvl = "warn" if e["burst_int_ms"] > e["ladder_ms"][0] else "ok"
+            lvl = "warn" if e["burst_int_ms"] > (e["ladder_ms"][0] if plan.auto_exposure else plan.int_ms) else "ok"
             out.append((lvl, f"{len(e['bursts'])} bursts at {e['burst_int_ms']:g} ms, with their own {e['burst_int_ms']:g} ms dark"
                              + (" (longer than the shortest slot time)" if lvl == "warn" else "")))
         if not (plan.pre_darks or plan.post_darks):
@@ -1277,6 +1284,8 @@ class Window(Q.QMainWindow):
                "if that time has passed.")
         if self._ask("Resume run", txt, "Resume now", "Not now"):
             self._resume(r["run_dir"], st.get("serial", "")); return
+        if needs_watching(r):                  # 'Not now' means it: the watchdog must not resume it behind your back
+            watchdog_off(r["run_dir"], "'Not now' in the window")
         self._auto_connect()
 
     def _auto_connect(self, rescan=False):
@@ -1284,7 +1293,7 @@ class Window(Q.QMainWindow):
         if not self._auto or self.link is not None or self._expect_attach is not None or self.state != "DISCONNECTED":
             return
         if rescan:
-            if live_sessions():
+            if live_sessions() or watched_runs():   # 0.3.11: a run the watchdog is about to resume needs the spectrometer free
                 return
             devs, _ = list_devices(True)
             if [i for i, _ in devs if i != SIM_ID] and [i for i, _ in devs] != [self.dev_combo.itemData(k) for k in range(self.dev_combo.count())]:
@@ -1332,6 +1341,9 @@ class Window(Q.QMainWindow):
 
     def _slow_tick(self):
         self.clock.setText(dt.datetime.now(LOCAL_TZ).strftime("%H:%M:%S"))
+        holds = self.link is None and self.engine.state != "DISCONNECTED"
+        if holds != self._holds_device:
+            self._holds_device = holds; set_window_holds(holds)
         if self.link is None and (self._expect_attach is not None or (self.state == "DISCONNECTED" and time.time() - self._last_attach_try > 3)):
             self._last_attach_try = time.time()
             if self._try_attach(self._expect_attach[0] if self._expect_attach else None):

@@ -38,6 +38,12 @@ w.engine.send("connect", SIM_ID, True, True); pump(5, lambda: w.state == "IDLE")
 w.exp_mode.setCurrentIndex(1); w.int_spin.setValue(100); w._toggle_preview(); pump(1)
 w.lat.setValue(38.89); w.lon.setValue(-77.04); pump(0.3)
 p = w._plan()
+check("the default back-off at 500 ms warns what its 51 times cost", any(lv == "warn" and t.startswith("Back off makes 50 integration")
+      for lv, t in w._preflight(p, estimates(p, 2068, int(w.info.get("min_int_us_used", 8000)), int(w.info.get("max_int_us", 6e7))))))
+w.run_int.setValue(50); pump(0.2); p = w._plan()
+check("at 50 ms it steps 50, 40, 30, 20, 10 with no warning", not any(t.startswith("Back off makes") for _, t in w._preflight(
+      p, estimates(p, 2068, int(w.info.get("min_int_us_used", 8000)), int(w.info.get("max_int_us", 6e7))))))
+w.run_int.setValue(500); w.backoff_step.setValue(0); pump(0.2); p = w._plan()     # the rest: plain fixed exposure
 check("a run defaults to Fixed 500 ms, whatever the live view uses", (p.auto_exposure, p.int_ms) == (False, 500.0), f"live view at {w.latest_int}")
 check("the automatic range is greyed out under Fixed", not w.auto_range_row.isEnabled())
 dev = lambda: (int(w.info.get("min_int_us_used", 8000)), int(w.info.get("max_int_us", 6e7)))  # noqa: E731

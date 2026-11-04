@@ -76,7 +76,7 @@ w._on_click(Ev(a0, 600.0, 0.5 * peak, dblclick=True)); pump(1.0)
 check("double-click resets to auto-scale", w.cb_auto.isChecked() and abs(a0.get_xlim()[0] - w.axis[0]) < 1)
 
 now = dt.datetime.now(LOCAL_TZ)
-w.out_edit.setText(str(TMP / "runs")); w.ladder_edit.setText("8,10,20,50,100,200"); w.max_spin.setValue(200); w.dark_s.setValue(0.2)
+w.out_edit.setText(str(TMP / "runs")); w.ladder_edit.setText("8,10,20,50,100,200"); w.max_spin.setValue(200); w.dark_s.setValue(0.2); w.backoff_step.setValue(0)
 w.start_mode.setCurrentIndex(0); w.stop_mode.setCurrentIndex(0)
 w.stop_edit.setDateTime(w.stop_edit.dateTime().currentDateTime().addSecs(150))
 w.burst_every.setValue(0); w.cb_logon.setChecked(False)

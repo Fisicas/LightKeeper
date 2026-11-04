@@ -30,6 +30,7 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
   to be useful are skipped and logged.
 - **Survives the real world.**
   - A supervisor restarts a crashed recorder and resumes the run as a new segment.
+  - A watchdog resumes the run if the recorder and supervisor die together.
   - USB faults reopen the spectrometer by serial number.
   - After a Windows restart, an open run resumes at logon.
   - Closing the window never stops a run.
@@ -110,7 +111,7 @@ The tests run against the simulator:
 - the clock check, with a mocked socket;
 - the 2026 daylight-saving change.
 
-The GUI checks (`tests/gui_recorder_smoke.py`, `tests/gui_schedule_running.py`, `tests/gui_save_spectrum.py`, `tests/gui_time_range.py`, `tests/gui_preflight.py`) are scripts that run off-screen with
+The GUI checks (`tests/gui_recorder_smoke.py`, `tests/gui_schedule_running.py`, `tests/gui_save_spectrum.py`, `tests/gui_time_range.py`, `tests/gui_preflight.py`, `tests/gui_watchdog.py`) are scripts that run off-screen with
 `QT_QPA_PLATFORM=offscreen`. `python -X utf8 tools/make_social.py` rebuilds the social preview and icon.
 
 ## Status
