@@ -118,7 +118,7 @@ def load_run(run_dir, valid=None, progress=None) -> dict:
                                       par=float(met["par"][j]), rfr=float(met["rfr"][j]), nirred=float(met["nirred"][j]),
                                       o2a=float(met["o2a"][j])))
                     if k % stride == 0:
-                        spectra.append((tl, rate[j].astype(np.float32)))
+                        spectra.append((tl, rate[j].astype(np.float32), mean[j].astype(np.float32)))
                     k += 1
                 done += mean.shape[0]
                 if progress:

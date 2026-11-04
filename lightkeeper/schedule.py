@@ -5,6 +5,7 @@ import dataclasses as dc
 import datetime as dt
 import math
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -28,6 +29,29 @@ def _env_site():
 
 DEFAULT_OUT_DIR = os.environ.get("LIGHTKEEPER_DATA_ROOT") or str(Path.home() / "Documents" / "LightKeeper Runs")
 DEFAULT_SITE = _env_site()   # "lat,lon" in LIGHTKEEPER_SITE; the window remembers the last site used
+
+
+def next_label(label: str) -> str:
+    """The next run's label: a trailing 'day N' counts up ('canopy day 2' -> 'canopy day 3'); anything else stays."""
+    m = re.search(r"((?<![A-Za-z])day[ _-]?)(\d+)\s*$", label, re.IGNORECASE)
+    return f"{label[:m.start()]}{m.group(1)}{int(m.group(2)) + 1}" if m else label
+
+
+def next_clock_time(iso: str, after: dt.datetime) -> dt.datetime:
+    """The same local clock time as iso, at its first occurrence after 'after'."""
+    t = dt.datetime.fromisoformat(iso).astimezone(LOCAL_TZ).time().replace(tzinfo=None)
+    c = dt.datetime.combine(after.date(), t, LOCAL_TZ)
+    return c if c > after else dt.datetime.combine(after.date() + dt.timedelta(days=1), t, LOCAL_TZ)
+
+
+def old_default_times(app: str, plan: dict) -> tuple[bool, bool]:
+    """(start, stop) of a plan that only holds the defaults from before 0.3.12, rather than a choice someone made. A new
+    run does not inherit these, so the first run after the change of default uses nautical times."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", app or "")
+    if m and tuple(int(x) for x in m.groups()) >= (0, 3, 12):
+        return False, False
+    return ((plan.get("start_event") == "astronomical dawn (-18°)" and plan.get("start_offset_min") == -20),
+            (plan.get("stop_event") == "astronomical dusk (-18°)" and plan.get("stop_offset_min") == 20))
 
 
 @dc.dataclass

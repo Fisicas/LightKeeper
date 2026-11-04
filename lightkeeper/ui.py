@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+from bisect import bisect_left
 from pathlib import Path
 
 import matplotlib
@@ -38,7 +39,8 @@ from .link import RecorderLink  # noqa: E402
 from .procs import (app_home, entry_args, live_sessions, needs_watching, open_runs, read_json, set_window_holds, spawn_detached,  # noqa: E402
                     supervisor_alive, watched_runs, watchdog_off,  # noqa: E402
                     write_json_atomic)
-from .schedule import SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, solar_day, sun_events  # noqa: E402
+from .schedule import (SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, next_clock_time,  # noqa: E402
+                       next_label, old_default_times, solar_day, sun_events)
 from .storage import LOCAL_TZ, local_dt  # noqa: E402
 
 from . import hotpix, runview, theme  # noqa: E402
@@ -88,6 +90,76 @@ def plot_toolbar(canvas, parent):
             tb.removeAction(a)
     tb.setIconSize(QtCore.QSize(18, 18))
     return tb
+
+
+class WavelengthCursor:
+    """A line placed on a plot to read wavelengths: click or drag to place it; arrow keys move it one pixel (Shift: ten).
+    It snaps to pixels, and survives the plots being redrawn (sync() puts it back after ax.cla())."""
+    def __init__(self, canvas, toolbar, axes, xs, on_move, with_time=False):
+        self.canvas, self.toolbar, self.axes, self.xs, self.on_move, self.with_time = canvas, toolbar, axes, xs, on_move, with_time
+        self.on = False; self.x = None; self.y = None; self.drag = False; self.lines = []
+        canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        for name, fn in (("button_press_event", self._press), ("motion_notify_event", self._motion),
+                         ("button_release_event", self._release), ("key_press_event", self._key)):
+            canvas.mpl_connect(name, fn)
+
+    def enable(self, on):
+        self.on = bool(on); self.drag = False; self.sync(); self.canvas.draw_idle(); self.on_move()
+
+    def sync(self):
+        """Draw the lines for the current state. Plots that were cleared have lost theirs, so they are made afresh."""
+        for ln in self.lines:
+            try:
+                ln.remove()
+            except (ValueError, NotImplementedError, AttributeError):
+                pass
+        self.lines = []
+        if not self.on or self.x is None:
+            return
+        for a in self.axes():
+            self.lines.append(a.axvline(self.x, color=TEXT, lw=0.8, ls=(0, (3, 2)), gid="cursor", zorder=5))
+            if self.with_time and self.y is not None:
+                self.lines.append(a.axhline(self.y, color=TEXT, lw=0.8, ls=(0, (3, 2)), gid="cursor", zorder=5))
+
+    def _snap(self, x):
+        xs = self.xs()
+        return float(xs[int(np.argmin(np.abs(xs - x)))]) if xs is not None and len(xs) else float(x)
+
+    def _place(self, x, y=None):
+        self.x = self._snap(x)
+        if y is not None:
+            self.y = y
+        self.sync(); self.canvas.draw_idle(); self.on_move()
+
+    def _press(self, ev):
+        if not self.on or ev.button != 1 or ev.dblclick or ev.xdata is None or ev.inaxes not in self.axes() or getattr(self.toolbar, "mode", ""):
+            return
+        self.canvas.setFocus(); self.drag = True; self._place(ev.xdata, ev.ydata)
+
+    def _motion(self, ev):
+        if self.drag and ev.xdata is not None and ev.inaxes in self.axes():
+            self._place(ev.xdata, ev.ydata)
+
+    def _release(self, ev):
+        self.drag = False
+
+    def _key(self, ev):
+        if not self.on or self.x is None or not ev.key:
+            return
+        n = {"left": -1, "right": 1, "shift+left": -10, "shift+right": 10}.get(ev.key)
+        xs = self.xs()
+        if n and xs is not None and len(xs):
+            self._place(float(xs[int(np.clip(np.argmin(np.abs(xs - self.x)) + n, 0, len(xs) - 1))]))
+
+
+class JumpSlider(Q.QSlider):
+    """A slider that goes where you click (a plain QSlider only steps towards it), and can be dragged from there."""
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton and self.maximum() > self.minimum():
+            o = Q.QStyleOptionSlider(); self.initStyleOption(o)
+            h = self.style().subControlRect(Q.QStyle.ComplexControl.CC_Slider, o, Q.QStyle.SubControl.SC_SliderHandle, self).width()
+            self.setValue(Q.QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), int(ev.position().x()) - h // 2, self.width() - h))
+        super().mousePressEvent(ev)
 
 
 def section(lay, title):
@@ -218,12 +290,15 @@ class Window(Q.QMainWindow):
         self.slots = []; self.spectra = []; self.spec_stride = 1; self._slot_count = 0; self._dirty_ts = False
         self.run_dir = None; self.plan = None; self.run_plan = None; self.run_times = None; self.cal = {}; self.cal_result = None; self.n_bursts = 0; self._last_ts_draw = 0.0
         self._dialog = False; self._last_live = 0; self._scan_new = False
+        self._scrub_t = None; self._usable_cache = (None, 0); self._recent_shown = None; self._wf_shown = None
+        self._applying_setup = False; self._setup_from = None
         self.viewing = None; self._load = None; self.link = None; self._expect_attach = None; self._closed_run = False; self._a1_ylim = None; self._last_attach_try = 0.0
         # like OceanView: open the first attached spectrometer and show single 100 ms scans, without pressing Connect.
         # Off after the user disconnects; a device that failed to open is not retried until the attached set changes.
         self._auto = os.environ.get("LIGHTKEEPER_AUTOCONNECT", "1") != "0"; self._auto_live = False; self._auto_failed = None; self._last_auto_try = 0.0
         self._build()
         self.exp_mode.setCurrentIndex(1); self.int_spin.setValue(LIVE_START_MS)
+        self._apply_previous_setup()
         self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self._poll); self.timer.start(50)
         self.slow = QtCore.QTimer(self); self.slow.timeout.connect(self._slow_tick); self.slow.start(1000)
         if not self._try_attach():
@@ -333,6 +408,7 @@ class Window(Q.QMainWindow):
         a, b, txt = self._time_window()
         self._log(f"opened {r['name']} read-only: {r['n_slots']:,} slots in {len(r['files'])} files, darks from the {r['dark_source']}; "
                   f"showing {txt}")
+        self._scrub_t = None; self._draw_recent()
         self._redraw_ranged(); self.tabs.setCurrentIndex(1)
 
     def _close_recorded_run(self):
@@ -342,6 +418,7 @@ class Window(Q.QMainWindow):
         self.run_lbl.setText("No run"); self.run_lbl.setToolTip(""); self.a_close_rec.setEnabled(False); self.m["slots"].setText("–")
         for a in list(self.c_ts.ax) + list(self.c_wf.ax):
             a.cla(); style_ax(a)
+        self._wf_shown = None; self._draw_recent()
         self.c_ts.draw_idle(); self.c_wf.draw_idle(); self.range_info.setText("")
 
     def _range_mode_changed(self, i):
@@ -460,6 +537,8 @@ class Window(Q.QMainWindow):
 
         section(lay, "Run")
         f = form(lay)
+        self.setup_src = Q.QLabel(""); self.setup_src.setObjectName("secondary"); self.setup_src.setWordWrap(True); self.setup_src.setVisible(False)
+        f.addRow(self.setup_src)
         self.label_edit = Q.QLineEdit(""); self.label_edit.setPlaceholderText("e.g. rooftop_south_diffuser"); f.addRow("Label", self.label_edit)
         self.geom_edit = Q.QLineEdit(""); self.geom_edit.setPlaceholderText("e.g. 50 um fiber + diffuser, facing south"); f.addRow("Geometry", self.geom_edit)
         self.geom_edit.setCursorPosition(0)
@@ -495,15 +574,15 @@ class Window(Q.QMainWindow):
         now = QtCore.QDateTime.currentDateTime()
         self.start_edit = DateTimeEdit(now.addSecs(600)); self.start_edit.setDisplayFormat("yyyy-MM-dd HH:mm"); self.start_edit.setCalendarPopup(True)
         f.addRow("Start time", self.start_edit)
-        self.start_event = Combo(); self.start_event.addItems(events[:4]); self.start_event.setCurrentIndex(0)
-        self.start_off = dspin(-240, 240, -20, 0, 5, "min"); self.start_off.setFixedWidth(84)
+        self.start_event = Combo(); self.start_event.addItems(events[:4]); self.start_event.setCurrentText("nautical dawn (-12°)")
+        self.start_off = dspin(-240, 240, 0, 0, 5, "min"); self.start_off.setFixedWidth(84)
         self.row_start_event = hbox(self.start_event, self.start_off); f.addRow("Start event", self.row_start_event)
         self.stop_mode = Combo(); self.stop_mode.addItems(["At a set time", "At a sun event"]); self.stop_mode.setCurrentIndex(1); f.addRow("Stop", self.stop_mode)
         stop = QtCore.QDateTime(now.date(), QtCore.QTime(19, 15)); stop = stop if stop > now else stop.addDays(1)
         self.stop_edit = DateTimeEdit(stop); self.stop_edit.setDisplayFormat("yyyy-MM-dd HH:mm"); self.stop_edit.setCalendarPopup(True)
         f.addRow("Stop time", self.stop_edit)
-        self.stop_event = Combo(); self.stop_event.addItems(events[4:]); self.stop_event.setCurrentIndex(3)
-        self.stop_off = dspin(-240, 240, 20, 0, 5, "min"); self.stop_off.setFixedWidth(84)
+        self.stop_event = Combo(); self.stop_event.addItems(events[4:]); self.stop_event.setCurrentText("nautical dusk (-12°)")
+        self.stop_off = dspin(-240, 240, 0, 0, 5, "min"); self.stop_off.setFixedWidth(84)
         self.row_stop_event = hbox(self.stop_event, self.stop_off); f.addRow("Stop event", self.row_stop_event)
         self.when_lbl = Q.QLabel(""); self.when_lbl.setObjectName("secondary"); self.when_lbl.setWordWrap(True); lay.addWidget(self.when_lbl)
 
@@ -597,6 +676,64 @@ class Window(Q.QMainWindow):
         self._schedule_rows()
         return frame
 
+    def _apply_previous_setup(self):
+        """Fill the setup panel from the newest run in the Save in folder, so setting up a run takes one press of Start.
+        Dates and times are worked out afresh; a label ending in 'day N' counts up. Every field can still be edited."""
+        last, _ = self._last_runs("")
+        p = (last or {}).get("plan")
+        if not p or last.get("_folder") == self._setup_from:
+            return
+        self._setup_from = last.get("_folder")
+        self._applying_setup = True
+        try:
+            def put(key, fn):
+                if key in p and p[key] is not None:
+                    fn(p[key])
+            put("label", lambda v: self.label_edit.setText(next_label(str(v))))
+            put("geometry", self.geom_edit.setText); put("notes", self.notes_edit.setText); put("diffuser_id", self.diff_edit.setText)
+            for k, s in self.setup_spins.items():
+                if k in p:
+                    s.setValue(s.minimum() if p[k] is None else float(p[k]))
+            put("window_state", self.window_cb.setCurrentText)
+            put("setup_photo", lambda v: self.photo_edit.setText(v if v and Path(v).exists() else ""))
+            for k, s in (("slot_s", self.slot_spin), ("int_ms", self.run_int), ("min_int_ms", self.min_spin), ("max_int_ms", self.max_spin),
+                         ("backoff_step_ms", self.backoff_step), ("backoff_min_ms", self.backoff_min), ("burst_every_min", self.burst_every),
+                         ("burst_offset_min", self.burst_off), ("burst_s", self.burst_s), ("burst_max_int_ms", self.burst_int),
+                         ("dark_s_per_int", self.dark_s), ("long_dark_ms", self.long_dark), ("site_lat", self.lat), ("site_lon", self.lon)):
+                put(k, lambda v, s=s: s.setValue(float(v)))
+            put("auto_exposure", lambda v: self.run_exp.setCurrentIndex(1 if v else 0))
+            put("ladder_ms", lambda v: self.ladder_edit.setText(",".join(f"{float(x):g}" for x in v)))
+            for k, c in (("edc", self.cb_edc), ("nlc", self.cb_nlc), ("store_sd", self.cb_sd), ("pre_darks", self.cb_pre),
+                         ("post_darks", self.cb_post), ("auto_resume_logon", self.cb_logon)):
+                put(k, lambda v, c=c: c.setChecked(bool(v)))
+            # the schedule: the same choice of start and stop, with the dates worked out afresh
+            old_start, old_stop = old_default_times(last.get("app", ""), p)
+            now = dt.datetime.now(LOCAL_TZ); to_q = lambda t: QtCore.QDateTime(QtCore.QDate(t.year, t.month, t.day), QtCore.QTime(t.hour, t.minute))  # noqa: E731
+            start = now
+            if not old_start:
+                if p.get("start_now"):
+                    self.start_mode.setCurrentIndex(0)
+                elif p.get("start_event") and self.start_event.findText(p["start_event"]) >= 0:
+                    self.start_mode.setCurrentIndex(2); self.start_event.setCurrentText(p["start_event"])
+                    self.start_off.setValue(float(p.get("start_offset_min", 0)))
+                elif p.get("start_local"):
+                    start = next_clock_time(p["start_local"], now); self.start_mode.setCurrentIndex(1); self.start_edit.setDateTime(to_q(start))
+            if not old_stop:
+                if p.get("stop_event") and self.stop_event.findText(p["stop_event"]) >= 0:
+                    self.stop_mode.setCurrentIndex(1); self.stop_event.setCurrentText(p["stop_event"])
+                    self.stop_off.setValue(float(p.get("stop_offset_min", 0)))
+                elif p.get("stop_local"):
+                    self.stop_mode.setCurrentIndex(0); self.stop_edit.setDateTime(to_q(next_clock_time(p["stop_local"], start)))
+        finally:
+            self._applying_setup = False
+        self.label_edit.setCursorPosition(0); self.geom_edit.setCursorPosition(0)
+        self.auto_range_row.setEnabled(self.run_exp.currentIndex() == 1); self.backoff_row.setEnabled(self.run_exp.currentIndex() == 0)
+        self._schedule_rows(); self._show_site()
+        self.setup_src.setText("Setup copied from the previous run"); self.setup_src.setToolTip(f"{self._setup_from}\nDates and times are new. Edit anything before pressing Start.")
+        self.setup_src.setVisible(True)
+        self._log(f"setup copied from the previous run, {self._setup_from}")
+        self._update_schedule()
+
     def _schedule_rows(self, *_):
         """Show only the schedule fields that apply to the chosen start and stop modes."""
         f = self.f_sched; sm = self.start_mode.currentIndex(); stm = self.stop_mode.currentIndex()
@@ -620,7 +757,7 @@ class Window(Q.QMainWindow):
     # ---- tabs
     def _tab_spectrum(self):
         w = Q.QWidget(); v = Q.QVBoxLayout(w); v.setContentsMargins(0, 6, 0, 0); v.setSpacing(4)
-        self.c_spec = Canvas(3, 1, [2.3, 0.06, 1.0], sharex=True)
+        self.c_spec = Canvas(3, 1, [2.0, 0.06, 1.0], sharex=True)
         self.ax_strip = self.c_spec.ax.pop(1)
         r = Q.QHBoxLayout(); r.setSpacing(8)
         self.spec_tb = plot_toolbar(self.c_spec, self); r.addWidget(self.spec_tb)
@@ -647,10 +784,26 @@ class Window(Q.QMainWindow):
         self.btn_save_spec.setToolTip("Save the scan on screen as it is shown (Ctrl+S): <label>_<date>_<time>.dpt, two columns "
                                       "(wavelength nm, counts) that OPUS opens, plus a .json with the details, in <Save in>\\..\\spectra")
         self.btn_save_spec.clicked.connect(self._save_spectrum); r.addWidget(self.btn_save_spec)
+        self.cb_spec_cur = Q.QCheckBox("Cursor")
+        self.cb_spec_cur.setToolTip("Click or drag on a plot to read the wavelength. Arrow keys move one pixel, Shift+arrow ten.")
+        r.addWidget(self.cb_spec_cur)
+        self.spec_cur_info = Q.QLabel(""); r.addWidget(self.spec_cur_info)
         for c in (self.cb_auto, self.cb_dark, self.cb_rate, self.cb_log, self.cb_mask, self.cb_cal):
             c.toggled.connect(lambda *_: self._draw_live(force=True))
-        r.addStretch(1); self.live_info = Q.QLabel(""); self.live_info.setObjectName("secondary"); r.addWidget(self.live_info)
+        self.live_info = Q.QLabel(""); self.live_info.setObjectName("secondary"); self.live_info.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.live_info.setSizePolicy(Q.QSizePolicy.Policy.Ignored, Q.QSizePolicy.Policy.Preferred); r.addWidget(self.live_info, 1)   # long text must not widen the window
         v.addLayout(r); v.addWidget(self.c_spec, 1)
+        tr = Q.QHBoxLayout(); tr.setContentsMargins(8, 0, 8, 2); tr.setSpacing(8)
+        self.scrub_first = Q.QLabel(""); self.scrub_first.setObjectName("secondary"); tr.addWidget(self.scrub_first)
+        self.scrub = JumpSlider(QtCore.Qt.Orientation.Horizontal); self.scrub.setEnabled(False)
+        self.scrub.setToolTip("Slide through the recorded slots. Far left: start of usable light. Far right: present, or the end of the run.")
+        self.scrub.valueChanged.connect(self._scrub_moved); tr.addWidget(self.scrub, 1)
+        self.scrub_last = Q.QLabel(""); self.scrub_last.setObjectName("secondary"); tr.addWidget(self.scrub_last)
+        v.addLayout(tr)
+        self._scrub_timer = QtCore.QTimer(self); self._scrub_timer.setSingleShot(True); self._scrub_timer.setInterval(40)
+        self._scrub_timer.timeout.connect(self._draw_recent)
+        self.spec_cursor = WavelengthCursor(self.c_spec, self.spec_tb, lambda: list(self.c_spec.ax), self._cursor_pixels, self._spec_cursor_text)
+        self.cb_spec_cur.toggled.connect(self.spec_cursor.enable)
         self.c_spec.mpl_connect("scroll_event", self._on_scroll)
         self.c_spec.mpl_connect("button_press_event", self._on_click)
         self.c_spec.mpl_connect("button_release_event", self._on_release)
@@ -680,10 +833,15 @@ class Window(Q.QMainWindow):
 
     def _tab_waterfall(self):
         w = Q.QWidget(); v = Q.QVBoxLayout(w); v.setContentsMargins(0, 6, 0, 0); r = Q.QHBoxLayout()
-        self.wf_mode = Q.QComboBox(); self.wf_mode.addItems(["Spectral shape, normalised at 780–820 nm", "Log₁₀ counts/s", "Ratio to the first slot"])
+        self.wf_mode = Q.QComboBox(); self.wf_mode.addItems(["Spectral shape, normalised at 780–820 nm", "Log₁₀ counts/s", "Ratio to the first slot", "Raw counts, as recorded"])
         self.wf_mode.currentIndexChanged.connect(lambda *_: self._draw_waterfall())
-        self.c_wf = Canvas(1, 1); r.addWidget(plot_toolbar(self.c_wf, self)); r.addSpacing(8)
-        lab = Q.QLabel("Show"); lab.setObjectName("secondary"); r.addWidget(lab); r.addWidget(self.wf_mode); r.addStretch(1); v.addLayout(r)
+        self.c_wf = Canvas(1, 1); self.wf_tb = plot_toolbar(self.c_wf, self); r.addWidget(self.wf_tb); r.addSpacing(8)
+        lab = Q.QLabel("Show"); lab.setObjectName("secondary"); r.addWidget(lab); r.addWidget(self.wf_mode); r.addSpacing(8)
+        self.cb_wf_cur = Q.QCheckBox("Cursor"); self.cb_wf_cur.setToolTip("Click or drag on the plot to read the wavelength, time and value. Arrow keys move one pixel, Shift+arrow ten.")
+        r.addWidget(self.cb_wf_cur); self.wf_cur_info = Q.QLabel(""); r.addWidget(self.wf_cur_info); r.addStretch(1); v.addLayout(r)
+        self.wf_cursor = WavelengthCursor(self.c_wf, self.wf_tb, lambda: list(self.c_wf.ax), lambda: None if self._wf_shown is None else self._wf_shown[0],
+                                          self._wf_cursor_text, with_time=True)
+        self.cb_wf_cur.toggled.connect(self.wf_cursor.enable)
         v.addWidget(self.c_wf, 1); self.wf_cbar = None
         self.c_wf.ax[0].set_title("Recorded spectra over time")
         self.tabs.addTab(w, "Waterfall")
@@ -876,7 +1034,7 @@ class Window(Q.QMainWindow):
 
     def _site_changed(self):
         """A new site changes every sun time: say so, then redraw the schedule (it used to wait for the 30 s refresh)."""
-        if not hasattr(self, "sch_notice"):
+        if not hasattr(self, "sch_notice") or self._applying_setup:
             return
         self.sch_notice.setVisible(True); self.sch_text.setHtml(f"<p style='color:{ORANGE}'>Updating the schedule for the new site…</p>")
         QtCore.QTimer.singleShot(40, lambda: (self._update_schedule(), self.sch_notice.setVisible(False)))
@@ -888,6 +1046,7 @@ class Window(Q.QMainWindow):
             for d in Path(self.out_edit.text()).iterdir():
                 m = read_json(d / "run_metadata.json") if d.is_dir() else None
                 if m and m.get("planned_start_local"):
+                    m["_folder"] = d.name
                     metas.append(m)
         except Exception:
             return None, None
@@ -1198,6 +1357,7 @@ class Window(Q.QMainWindow):
                 self._log(f"run closed: {e['dir']} rows {e['rows']}"); self._closed_run = True
                 self._set_setup_visible(self.settings.value("setup_visible", True, type=bool), remember=False)
                 self.run_plan = None; self.run_times = None; self._update_schedule()
+                self._apply_previous_setup()        # the next run follows from the one that just closed
             elif t == "lamp_result":
                 self.cal[e["kind"]] = e; self._log(f"calibration {e['kind']}: {e['n']} scans at {e['int_us'] / 1000:g} ms")
                 if e["kind"] == "lamp":
@@ -1396,7 +1556,7 @@ class Window(Q.QMainWindow):
                                nirred=self._band(r, 780, 820) / self._band(r, 665, 680), o2a=1 - o2 / sh if sh else np.nan))
         self._slot_count += 1
         if self._slot_count % self.spec_stride == 0:
-            self.spectra.append((local_dt(e["t_ns"]), r.astype(np.float32)))
+            self.spectra.append((local_dt(e["t_ns"]), r.astype(np.float32), np.asarray(e["mean"], np.float32)))
             if len(self.spectra) > 1500:
                 self.spectra = self.spectra[::2]; self.spec_stride *= 2
         self._next_burst = e.get("next_burst", "")
@@ -1464,33 +1624,105 @@ class Window(Q.QMainWindow):
                                   ("hot pixels shown, " if not self.cb_mask.isChecked() else "no hot-pixel list (take a dark set), "))
                                + self.axis_label)
         if force or len(self.spectra) and getattr(self, "_drawn_spec", 0) != len(self.spectra):
-            xl = a0.get_xlim()
-            a1.cla(); style_ax(a1); a1.set_title("Recent slots, newest brightest")
-            recent = self.spectra[-24:]
-            cm = RECENT_CMAP
-            for j, (t, r) in enumerate(recent):
-                a1.plot(x[show], r[show], lw=0.6, color=cm(j / max(len(recent) - 1, 1)))
-            if not recent:
-                a1.text(0.5, 0.5, "Recorded slots appear here during a run", transform=a1.transAxes, ha="center", va="center", color=TEXT3)
-                a1.set_yticks([])
-            if recent:
-                a1.text(0.99, 0.95, f"{recent[0][0]:%H:%M:%S} → {recent[-1][0]:%H:%M:%S}", transform=a1.transAxes, ha="right", va="top", color=MUTED, fontsize=8)
-            a1.set_xlabel(f"Wavelength (nm, {self.axis_label})"); a1.set_ylabel("Dark-corrected counts/s")
-            a1.yaxis.set_major_formatter(THOUSANDS)
-            self._drawn_spec = len(self.spectra)
-            a0.set_xlim(xl)
-            if self._a1_ylim is not None and not self.cb_auto.isChecked():
-                a1.set_ylim(self._a1_ylim)
-            else:
-                self._fit_y(a1, xl)
+            self._draw_recent()
+        self.spec_cursor.sync(); self._spec_cursor_text()
         self.c_spec.draw_idle()
+
+    def _draw_recent(self):
+        """The lower Spectrum plot: the 24 stored slots up to the slider's position, newest brightest. The slider runs from
+        the start of usable light to the newest slot; at the far right it stays on the newest slot as new ones arrive."""
+        if self.axis is None and self.latest is None:
+            return
+        x = self._x(); a0, a1 = self.c_spec.ax
+        if self.latest is None and self.cb_auto.isChecked():          # a recorded run with no live scan above it
+            a0.set_xlim(x[0], x[-1]); self._strip_key = None; self._draw_strip()
+        show = self.valid if (self.cb_mask.isChecked() and self.valid is not None and len(self.valid) == len(x)) else np.ones(len(x), bool)
+        xl = a0.get_xlim()
+        first, i = self._sync_scrub()
+        recent = self.spectra[max(first, i - 23):i + 1] if self.spectra else []
+        self._recent_shown = (recent[-1][0], x[show], recent[-1][1][show]) if recent else None
+        a1.cla(); style_ax(a1)
+        a1.set_title("Recent slots, newest brightest" if self._scrub_t is None or not recent else f"Slots up to {recent[-1][0]:%H:%M:%S}, newest brightest")
+        cm = RECENT_CMAP
+        for j, sp in enumerate(recent):
+            a1.plot(x[show], sp[1][show], lw=0.6, color=cm(j / max(len(recent) - 1, 1)))
+        if not recent:
+            a1.text(0.5, 0.5, "Recorded slots appear here during a run", transform=a1.transAxes, ha="center", va="center", color=TEXT3)
+            a1.set_yticks([])
+        if recent:
+            a1.text(0.99, 0.95, f"{recent[0][0]:%H:%M:%S} → {recent[-1][0]:%H:%M:%S}", transform=a1.transAxes, ha="right", va="top", color=MUTED, fontsize=8)
+        a1.set_xlabel(f"Wavelength (nm, {self.axis_label})"); a1.set_ylabel("Dark-corrected counts/s")
+        a1.yaxis.set_major_formatter(THOUSANDS)
+        self._drawn_spec = len(self.spectra)
+        a0.set_xlim(xl)
+        if self._a1_ylim is not None and not self.cb_auto.isChecked():
+            a1.set_ylim(self._a1_ylim)
+        else:
+            self._fit_y(a1, xl)
+            if not self.cb_auto.isChecked():      # Auto-scale off: hold this scale, so the slider shows the light changing
+                self._a1_ylim = a1.get_ylim()
+        self.spec_cursor.sync(); self._spec_cursor_text()
+        self.c_spec.draw_idle()
+
+    def _usable_first(self) -> int:
+        """Index in self.spectra of the first slot of usable light (0 if none is found yet). Worked out once a minute of slots."""
+        key = (len(self.slots) // 60, len(self.spectra))
+        if self._usable_cache[0] != key:
+            w_ = runview.usable_window([s["t"] for s in self.slots], [s["par"] for s in self.slots]) if len(self.slots) > 2 else None
+            times = [sp[0] for sp in self.spectra]
+            self._usable_cache = (key, min(bisect_left(times, w_[0]), max(len(times) - 1, 0)) if w_ else 0)
+        return self._usable_cache[1]
+
+    def _sync_scrub(self):
+        """Fit the slider to the stored slots and return (first index, index shown). It follows a time, not an index,
+        because the store thins itself out as a run grows."""
+        n = len(self.spectra)
+        if not n:
+            self._scrub_t = None
+            self.scrub.blockSignals(True); self.scrub.setRange(0, 0); self.scrub.blockSignals(False); self.scrub.setEnabled(False)
+            self.scrub_first.setText(""); self.scrub_last.setText("")
+            return 0, 0
+        first = self._usable_first()
+        i = n - 1 if self._scrub_t is None else min(n - 1, max(first, bisect_left([sp[0] for sp in self.spectra], self._scrub_t)))
+        self.scrub.blockSignals(True); self.scrub.setRange(first, n - 1); self.scrub.setValue(i); self.scrub.blockSignals(False)
+        self.scrub.setEnabled(n - 1 > first)
+        self.scrub_first.setText(f"{self.spectra[first][0]:%H:%M}"); self.scrub_last.setText(f"{self.spectra[-1][0]:%H:%M}")
+        return first, i
+
+    def _scrub_moved(self, v):
+        self._scrub_t = None if v >= self.scrub.maximum() else self.spectra[v][0]
+        self._scrub_timer.start()
+
+    def _cursor_pixels(self):
+        return None if self.axis is None and self.latest is None else self._x()
+
+    def _spec_cursor_text(self):
+        c = self.spec_cursor
+        if not c.on or c.x is None:
+            self.spec_cur_info.setText("Click a plot to place the cursor" if c.on else ""); return
+        parts = [f"<b>{c.x:.2f} nm</b>"]
+        xd, yd = np.asarray(self.l_live.get_xdata(), float), np.asarray(self.l_live.get_ydata(), float)
+        if xd.size:
+            parts.append(f"live {yd[int(np.argmin(np.abs(xd - c.x)))]:,.1f} {'counts/s' if self.cb_rate.isChecked() else 'counts'}")
+        if self._recent_shown is not None:
+            t, xs, ys = self._recent_shown
+            parts.append(f"{t:%H:%M:%S} slot {ys[int(np.argmin(np.abs(xs - c.x)))]:,.1f} counts/s")
+        self.spec_cur_info.setText(", ".join(parts))
+
+    def _wf_cursor_text(self):
+        c = self.wf_cursor
+        if not c.on or c.x is None or self._wf_shown is None:
+            self.wf_cur_info.setText("Click the plot to place the cursor" if c.on else ""); return
+        xs, tn, Z, unit = self._wf_shown
+        i = int(np.argmin(np.abs(xs - c.x))); j = int(np.argmin(np.abs(tn - c.y))) if c.y is not None else len(tn) - 1
+        self.wf_cur_info.setText(f"<b>{xs[i]:.2f} nm</b>, {mdates.num2date(tn[j], tz=LOCAL_TZ):%H:%M:%S}, {Z[j, i]:,.3g} {unit}")
 
     # ---- y-axis scaling of the Spectrum tab (0.2.0)
     def _fit_y(self, ax, xlim=None):
         """Fit the y-axis to the plotted spectra (the saturation line is ignored), optionally within an x range."""
         ys = []
         for ln in ax.get_lines():
-            if ln is self.l_sat or ln.get_gid() == "sat" or not ln.get_visible():
+            if ln is self.l_sat or ln.get_gid() in ("sat", "cursor") or not ln.get_visible():
                 continue
             xd = np.asarray(ln.get_xdata(), float); yd = np.asarray(ln.get_ydata(), float)
             if yd.size == 0 or xd.size != yd.size:
@@ -1596,13 +1828,15 @@ class Window(Q.QMainWindow):
         if len(shown) < 2:
             return
         a = self.c_wf.ax[0]; a.cla(); style_ax(a)
-        R = np.array([r for _, r in shown], float); t = [s for s, _ in shown]
+        mode = self.wf_mode.currentIndex()
+        R = np.array([sp[2 if mode == 3 else 1] for sp in shown], float); t = [sp[0] for sp in shown]
         if self.cb_mask.isChecked() and self.valid is not None:
             R = hotpix.fill(R, self.valid)
         x = self.axis; m = (x > 380) & (x < 1050)
-        mode = self.wf_mode.currentIndex()
         with np.errstate(divide="ignore", invalid="ignore"):
-            if mode == 0:
+            if mode == 3:
+                Z = R; lab = "counts per scan, no dark subtraction or scaling"
+            elif mode == 0:
                 Z = R / np.nanmean(R[:, (x >= 780) & (x <= 820)], 1, keepdims=True); lab = "relative to 780–820 nm"
             elif mode == 1:
                 Z = np.log10(np.clip(R, 1, None)); lab = "log10 counts/s"
@@ -1620,9 +1854,12 @@ class Window(Q.QMainWindow):
             except Exception:
                 pass
         self.wf_cbar = self.c_wf.fig.colorbar(im, ax=a, label=lab); self.wf_cbar.ax.tick_params(colors=MUTED, labelsize=8)
+        self._wf_shown = (x[m], np.asarray(tn), Z, lab.split(",")[0]); self.wf_cursor.sync(); self._wf_cursor_text()
         self.c_wf.draw_idle()
 
     def _update_schedule(self, *_):
+        if self._applying_setup:       # filling the form field by field: drawn once at the end
+            return
         # While a run is armed or recording, show the run the engine is executing: its plan snapshot and the start/stop
         # times fixed when Start was pressed. Re-resolving a sun-event plan from the form after today's event would
         # return tomorrow's times (bug in 0.1.0: display only, the engine always used the fixed times).

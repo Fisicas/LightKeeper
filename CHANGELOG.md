@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.12 (2026-11-04)
+- **A new run starts from the previous run's setup.** When the window opens, and when a run closes, the setup panel is
+  filled from the newest run in **Save in**, including the site, diffuser, fiber, schedule and acquisition settings.
+  - **Changes by itself:** dates and times; a label ending in `day N` counts up; a setup photo that no longer exists is dropped.
+  - **Exception:** a run from before 0.3.12 does not pass on the old default times, so the next run uses the new default.
+- **Wavelength cursor.** A **Cursor** tick box on the Spectrum and Waterfall tabs: click or drag to place it, arrow keys move
+  it one pixel. It shows the wavelength and the value there; on the Waterfall, the time as well.
+- **Slider through the run.** Under the Spectrum plots, the slider moves "Recent slots, newest brightest" from the start of
+  usable light (far left) to the present or the end of the run (far right). The Live scan plot is slightly shorter to fit it.
+  Opening a recorded run now fills this plot too.
+- **Raw counts on the Waterfall.** A new view, **Raw counts, as recorded**: mean counts per scan as stored, with no dark
+  subtraction and no scaling. The window keeps the stored means to do this, which adds up to about 12 MB of memory per run.
+- **New default schedule: nautical dawn to nautical dusk, no offsets.** It was astronomical dawn − 20 min to astronomical
+  dusk + 20 min. This drops about 1 h 40 min of night a day at
+  the field site in November. Existing runs keep their own plan, and any event and offset can still be chosen in the setup panel.
+  - **Why:** on 3 and 4 Nov, at 50 and 10 ms, signal appeared 30–40 min after nautical dawn. On 3 Nov it was gone about
+    35 min before nautical dusk. That margin still records the sky-dark baseline, which shows how far the dark level has
+    drifted during the day.
+
 ## 0.3.11 (2026-11-03)
 - **Watchdog.** A hidden scheduled task checks once a minute while a run is open, and resumes the run if its recorder and
   supervisor have died together. Until now only opening the window or logging on again could do that.

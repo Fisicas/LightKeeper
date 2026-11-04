@@ -27,7 +27,7 @@ scan per update), as OceanView does. Spectrometers plugged in later are picked u
 | Setup panel | Spectrometer; Live view (with **Take dark set…**); Run (label, geometry, notes, folder); Schedule; Acquisition (time slot, integration range, bursts, dark sets). **Show advanced settings** opens the ladder, dark time per integration time, SD storage, site and restart resume. |
 | Time range (Waterfall, Time series) | **Usable daylight (auto)** draws only where the 420–700 nm dark-corrected signal stays above 1 % of the day's bright level for 5 min; **All data** or **Custom** from/to; **Reset** returns to auto. The range drawn is quoted next to it. **Open recorded run…** shows a finished run read-only, dark-corrected with its pre-run dark set. |
 | Spectrum tab | **Save spectrum** (Ctrl+S) writes the scan on screen as a two-column `.dpt` (wavelength nm, signal; `#` header lines with the main details, which OPUS skips) plus a `.json` with everything, in `<Save in>\..\spectra\`, named `<label>_<date>_<time>` or just the time. **Live scan:** counts or counts/s, the matched dark and the saturation line. **Wavelength strip:** each wavelength in its colour, fading into the UV and the NIR. **Recent slots:** the last 24, newest brightest. The toolbar has navigation, Auto-scale, **Fit y** and **Display** (dark subtraction, counts/s, log y, hide hot/cold pixels, calibrated axis). |
-| Waterfall | Recorded spectra over time, as raw counts or as spectral shape normalised in a band you choose. |
+| Waterfall | Recorded spectra over time: spectral shape normalised at 780–820 nm, log₁₀ counts/s, ratio to the first slot, or **Raw counts, as recorded** (mean counts per scan as stored: no dark subtraction, no scaling to a wavelength or to integration time, so a change of integration time shows as a step). **Cursor** reads the wavelength, time and value at a click. |
 | Time series | Band-integrated signal, integration time and saturation over the run. |
 | Schedule tab | The plan as a table, plus the sun times, beside the solar-elevation plot. |
 | Calibration tab | Lamp wavelength calibration (see below). |
@@ -190,6 +190,19 @@ the source and are not comparable between species; they are used only to select 
   - Only spectrometers that the OceanDirect SDK can open over USB are supported. Network devices and spectrometers from
     other makers are not.
 
+## Starting from the previous run
+
+**What is copied:** when the window opens, and when a run closes, the setup panel is filled from the newest run in **Save in**: label, geometry, notes, diffuser, fiber, view, site, schedule choices, acquisition settings and switches. The panel says so, and its tooltip names the run. Everything can still be edited.
+
+**What changes by itself:**
+- **Dates and times:** sun events are worked out for the next day. A set time keeps its clock time and moves to its next occurrence.
+- **Label:** one ending in `day N` counts up, so `canopy day 2` becomes `canopy day 3`. Any other label stays, and the run folder gets its own date and version.
+- **Setup photo:** dropped if the file no longer exists.
+
+**Exception:** a run recorded before 0.3.12 with the old default times (astronomical, ±20 min) does not pass them on, so the next run uses the nautical default.
+
+**With no previous run:** the defaults below stand.
+
 ## Sun-event scheduling
 
 **Setting it up:** Start and Stop can each be tied to a sun event, plus an offset in minutes. The events are:
@@ -198,10 +211,13 @@ the source and are not comparable between species; they are used only to select 
 - civil, nautical or astronomical dusk.
 
 **Defaults:**
-- **Start:** astronomical dawn − 20 min.
-- **Stop:** astronomical dusk + 20 min.
-- **Why the margins:** the pre-dawn and post-dusk minutes record the night baseline at that window: building lights,
-  headlights, sky glow.
+- **Start:** nautical dawn, no offset.
+- **Stop:** nautical dusk, no offset.
+- **Why these:** on 3 and 4 Nov 2026, at 50 and 10 ms, signal appeared 30–40 min after nautical dawn. On 3 Nov it was gone
+  about 35 min before nautical dusk. Those minutes record the sky-dark baseline at the run's own exposure, which shows how
+  far the dark level has drifted since the pre-run darks. Astronomical times added about 1 h 40 min of night a day.
+- **Long exposures:** these detect light earlier. Move the start earlier if you want the first twilight, or building
+  lights and sky glow through the night.
 
 **When the times are fixed:** the times are computed for the site when you press Start and fixed then. They are stored in
 `run_metadata.json` (`planned_start_local`, `planned_stop_local`, `sun_events_local`).
@@ -288,6 +304,12 @@ Process files: `%LOCALAPPDATA%\LightKeeper\`, holding:
 - `open_runs\`;
 - `logs\`: supervisor, recorder and watchdog logs. A native crash leaves a Python traceback in the recorder log through
   `faulthandler`.
+
+**Spectrum tab cursor and slider.**
+- **Cursor:** tick it, then click or drag on either plot. It snaps to a pixel and shows the wavelength, the live value and the value in the newest slot shown. Arrow keys move it one pixel, Shift+arrow ten. The toolbar's pan and zoom tools take the click while they are on.
+- **Slider, under the plots:** moves the lower plot through the run. It shows the 24 stored slots up to that time, newest brightest. Far left is the start of usable light, as defined for the time range above; far right is the present, or the end of the run, and stays on the newest slot as new ones arrive.
+- **Spacing:** it steps through the stored slots, of which a window keeps up to 1,500 per run, about every 32 s over a full day. The recorded files keep every slot.
+- **Comparing brightness:** untick **Auto-scale** to hold the y-scale while you slide.
 
 **Spectrum tab y-axis.**
 - **Auto-scale** fits the y-axis to the data, not to the saturation line.
