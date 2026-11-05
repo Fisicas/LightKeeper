@@ -49,8 +49,8 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
   <img src="docs/images/screenshot-spectrum.png" alt="Spectrum tab during a recording: the live daylight scan, the wavelength-colour strip and the recent slots" width="100%">
 </p>
 <p align="center">
-  <img src="docs/images/screenshot-waterfall.png" alt="Waterfall tab: spectral shape over a morning, from pre-dawn darkness through sunrise" width="49%">
-  <img src="docs/images/screenshot-schedule.png" alt="Schedule tab: solar elevation, dark sets, recording window and burst times for a dawn-to-dusk run" width="49%">
+  <img src="docs/images/screenshot-waterfall.png" alt="Waterfall tab: spectral shape over one recorded day, trimmed automatically to usable daylight" width="49%">
+  <img src="docs/images/screenshot-schedule.png" alt="Schedule tab: solar elevation, dark sets, recording window and burst times for a run from nautical dawn to nautical dusk, shown for an example site" width="49%">
 </p>
 
 ## Supported spectrometers
