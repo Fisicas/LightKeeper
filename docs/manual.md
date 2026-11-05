@@ -75,8 +75,18 @@ setup panel can never change a value.
 6. **Recording.** Each slot (default 1 s) stores the per-pixel mean and SD of the n raw scans in that slot.
    - **Exposure:** fixed at the **Exposure** time (default 500 ms). With **Automatic**, the integration time steps along
      the ladder within the **Auto range**, never below 8 ms on a Maya2000 Pro.
-   - **Bursts:** at the scheduled times, every scan is stored at the burst's own time (default 50 ms), never longer than
-     the slot time in use. A burst predicted to fill < 1 % of full scale is skipped and logged.
+   - **Frames:** at 8 or more frames per slot, frames are read without any idle time. A frame belongs to the slot its return
+     time falls in, so a slot holds 99 or 100 frames at 10 ms, not exactly 100.
+   - **Bursts:** at the scheduled times (default 60 s every 15 min, at minute 7), every scan is stored at the burst's own
+     time, never longer than the slot time in use.
+     - **At the slot time** (for example a 50 ms burst setting with 10 ms slots): the slots go on through the burst with no
+       gap and no exposure command. Those slots summarize frames that are also in `burst`, so do not count them twice.
+       Automatic exposure and back-off wait until the burst ends.
+     - **At another time:** the slots pause for the burst, and two frames are discarded at each change of time.
+     - **Burst minimum:** a burst whose predicted raw p99.5 is below this is skipped and logged. Raw counts sit below zero at
+       night (about -100 at 10 ms), so the default of 0 is about 100 counts above dark.
+   - **Save every frame:** keeps every individual spectrum of the whole run in `burst` (`burst_id` 0), with the slots as well.
+     No scheduled bursts are needed. At 10 ms this is about 21 GB for a 12.6 h day.
    - **Temperature:** logged with every slot (`blocks/temperature_c`) when the spectrometer has a sensor the SDK can
      read (a cooled detector's thermistor). The Maya2000 Pro has none.
 7. At the stop time, or when you press Stop: cover the input. The **post-run dark set** covers the whole ladder again.
@@ -101,9 +111,17 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
 - **`events.csv`:** a journal of every event, with UTC nanoseconds and local time.
 - **`spectra_YYYYMMDD_HHMM.h5`:** files rotate hourly. Each holds `wavelength_nm_device` and three groups:
   - **`blocks`**: one row per slot. Fields: `t_wall_ns`, `t_start_wall_ns`, `t_end_wall_ns`, `slot_index`, `segment` (0.2.0), `int_us`,
-    `n_scans`, `mean`, `sd`, `max_raw_window`, `p995_mean_window`, `n_saturated_scans`, `overrun_ms`.
+    `n_scans`, `mean`, `sd`, `max_raw_window`, `p995_mean_window`, `n_saturated_scans`, `overrun_ms`. Take time from `t_wall_ns`,
+    never from `slot_index`: the slot grid runs on the PC's performance counter, which drifted about 20 ppm from the clock on
+    one PC. From 0.3.13, `overrun_ms` is how much later than expected the next frame came.
   - **`dark_scans`**: every dark scan, with `int_us`, `session` and `label` (`pre` or `post`).
   - **`burst`**: every burst scan, with `int_us` and `burst_id`.
+- **Storage (new files from 0.3.13):** lossless, built-in HDF5 gzip, so any HDF5 reader opens them with no extra package.
+  `blocks` arrays use 30-row chunks with shuffle. `burst` and `dark_scans` frames use chunks of 400 rows by 16 pixels without
+  shuffle, because gzip then finds a pixel's repeating values. Reading one pixel through time is also much faster; reading
+  one frame takes about 13 ms. The same 4 Nov 2026 run took 1.06 GB instead of 1.50 GB, with every value identical. Spectra
+  are stored as float32, as they always have been.
+- **`weather_vNN.json`** (optional): see below.
 - **Raw data only.** No dark subtraction, smoothing or resampling is applied in the files. Electric-dark and nonlinearity
   corrections are the device's own and are recorded as flags.
 - **Times:** all stored times are UTC. Daylight-saving changes affect only folder and file names; the repeated hour in
@@ -127,7 +145,22 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
     starts from its own dark sets.
   - The live-view readout says how many pixels are hidden, or "no hot-pixel list" when none is saved yet.
 - **Window log:** the Log tab is also written to `%LOCALAPPDATA%\LightKeeper\logs\window_<date>.log`.
-- **Crash safety:** a file is opened only during its 30 s flush, so a crash loses at most that buffer.
+- **Writing:** a separate file thread writes the data, the journal and the run state, so a slow disk does not cost frames.
+  If the drive stalls or disappears, rows wait in memory and writing keeps trying. At 512 MB behind, acquisition pauses and logs
+  `writer_backlog`; rows are never dropped.
+- **A sleeping drive:** the frame loop does not wait for the drive. After 2 minutes without a write, the file thread wakes the
+  drive before it opens an HDF5 file, and logs `the data drive took N s to wake` when that takes a second or more. During
+  recording, writes come every 30 s, so this does not run and the drive does not sleep. Before recording, darks and other steps
+  outside the frame loop can wait for it, and the window can pause briefly when it first looks at **Save in**.
+- **Crash safety:** a file is opened only while it is written. A crash loses what has not been stored: about 30 s of slots,
+  and at most about 8 s of burst frames, because frames wait in memory to complete a chunk, even between bursts. Stop and
+  Interrupt store everything.
+- **Weather:** **More → Fetch weather for a run…**, or the tick box under **Show advanced settings** for every run that
+  closes, or `LightKeeper.py --fetch-weather <run folder> ...`. It writes `weather_vNN.json` beside the run: airport
+  observations (via the Iowa Environmental Mesonet) and model cloud, radiation and aerosol (Open-Meteo, CC BY 4.0, free for
+  non-commercial use). It runs after recording and never touches the engine, the recorder or the HDF5 files. It sends the site,
+  rounded to two decimals, and the dates. Use it to label a day's conditions: an airport and a model grid do not see this
+  sensor's sky, so it cannot explain single events.
 - **Sleep:** Windows sleep is blocked while a run is active.
 
 ## Calibration (`<Save to>\..\calibrations\<date>_<lamp>_vNN\`)
@@ -287,7 +320,8 @@ as GammaKeeper's independent recorder).
   - after the stop time, or if recording had already ended: straight to POST_RUN for the post-run darks.
   - **Darks:** the pre-run darks are reloaded from the HDF5 files for the matched-dark display.
   - **Record:** the gap is written to `events.csv` and `run_metadata.json` (`resumes`).
-- **Lost data on a hard stop:** at most the unflushed buffer (≤ `flush_s`, default 30 s). If a flush was cut off, resume
+- **Lost data on a hard stop:** at most the unstored rows (about `flush_s` of slots, default 30 s, and about 8 s of burst
+  frames). If a flush was cut off, resume
   trims that table's columns back to equal length and logs `storage_repair`. If an hourly file cannot be opened, new rows
   for that hour go to `spectra_..._partN.h5`.
 

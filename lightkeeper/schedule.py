@@ -16,6 +16,10 @@ from .storage import LOCAL_TZ
 SETUP_FIELDS = ("fiber_core_um", "diffuser_id", "diffuser_thickness_mm", "fiber_diffuser_mm", "view_az_deg", "view_el_deg",
                 "window_state", "site_alt_m", "setup_photo")
 DEFAULT_LADDER_MS = [8, 10, 15, 20, 30, 50, 80, 100, 150, 200, 300, 500, 800, 1000, 1500, 2000, 3000]
+MAX_DARK_SCANS = 12000           # 0.3.13: was 30, which held a 10 ms dark to 0.3 s whatever the dark time was set to
+EXPECTED_SLOT_RATIO = 0.72       # stored / uncompressed, measured on 10 ms canopy spectra (2026-11-04); a planning figure
+EXPECTED_RAW_RATIO = 0.56
+RAW_FRAME_DUTY = 0.997           # frames returned per nominal frame time
 
 
 
@@ -42,6 +46,14 @@ def next_clock_time(iso: str, after: dt.datetime) -> dt.datetime:
     t = dt.datetime.fromisoformat(iso).astimezone(LOCAL_TZ).time().replace(tzinfo=None)
     c = dt.datetime.combine(after.date(), t, LOCAL_TZ)
     return c if c > after else dt.datetime.combine(after.date() + dt.timedelta(days=1), t, LOCAL_TZ)
+
+
+def old_acquisition_defaults(app: str, plan: dict) -> bool:
+    """True for a plan from before 0.3.13 that only holds the old burst and dark defaults, rather than a choice someone made."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", app or "")
+    if m and tuple(int(x) for x in m.groups()) >= (0, 3, 13):
+        return False
+    return (plan.get("burst_every_min"), plan.get("burst_offset_min"), plan.get("burst_s"), plan.get("dark_s_per_int")) == (60.0, 30.0, 120.0, 5.0)
 
 
 def old_default_times(app: str, plan: dict) -> tuple[bool, bool]:
@@ -79,6 +91,8 @@ class RunPlan:
     burst_offset_min: float = 30.0
     burst_s: float = 120.0
     burst_max_int_ms: float = 50.0   # 0.3.8: the burst's own integration time (never snapped onto the slot ladder)
+    burst_min_counts: float = 600.0  # 0.3.13: skip a burst whose predicted raw p99.5 is below this (0.01 of full scale, as before)
+    save_all_frames: bool = False    # 0.3.13: keep every frame of the whole run; scheduled bursts are not needed then
     long_dark_ms: float = 3000.0     # 0.3.8: fixed exposure also takes darks here, so the dark model has two times
     backoff_step_ms: float = 0.0     # 0.3.9: fixed exposure steps down by this much after a saturated slot (0 = off)...
     backoff_min_ms: float = 10.0     # ...but never below this, and steps back up towards int_ms when the light allows
@@ -173,7 +187,7 @@ def dark_ladder_us(plan: RunPlan, dev_min_us: int, dev_max_us: int) -> list[int]
 
 
 def dark_scan_count(int_us: int, dark_s: float) -> int:
-    return int(min(30, max(5, round(dark_s * 1e6 / int_us))))
+    return int(min(MAX_DARK_SCANS, max(5, round(dark_s * 1e6 / int_us))))
 
 
 def dark_session_seconds(ladder: list[int], dark_s: float, discard: int = 2) -> float:
@@ -280,14 +294,19 @@ def estimates(plan: RunPlan, n_pixels: int, dev_min_us: int, dev_max_us: int,
     dur = max(0.0, t1.timestamp() - t0.timestamp())   # real elapsed time; same-zone subtraction ignores a DST change
     lad = ladder_us(plan, dev_min_us, dev_max_us)
     dl = dark_ladder_us(plan, dev_min_us, dev_max_us)
-    bursts = burst_times(plan, t0, t1)
+    bursts = [] if plan.save_all_frames else burst_times(plan, t0, t1)
     b_int = min(burst_us(plan, dev_min_us, dev_max_us), lad[-1])
     per_spec = n_pixels * 4
     slots = dur / plan.slot_s
     slot_bytes = slots * per_spec * (2 if plan.store_sd else 1)
-    burst_scans = len(bursts) * plan.burst_s * 1e6 / b_int
+    burst_scans = (dur if plan.save_all_frames else len(bursts) * plan.burst_s) * 1e6 / (lad[-1] if plan.save_all_frames else b_int)
+    lit = burst_scans                 # bursts expected to run: a burst in the dark is skipped
+    if bursts and plan.burst_min_counts >= -100 and (plan.site_lat, plan.site_lon) != (0.0, 0.0):
+        el = solar_elevation(np.array([b.astimezone(dt.timezone.utc).replace(tzinfo=None) for b in bursts], dtype="datetime64[ns]"), plan.site_lat, plan.site_lon)
+        lit = float((el > 0).sum()) * plan.burst_s * 1e6 / b_int
     dark_scans = sum(dark_scan_count(u, plan.dark_s_per_int) for u in dl) * (int(plan.pre_darks) + int(plan.post_darks))
     total = slot_bytes + (burst_scans + dark_scans) * per_spec
+    expected = slot_bytes * EXPECTED_SLOT_RATIO + (lit * RAW_FRAME_DUTY + dark_scans) * per_spec * EXPECTED_RAW_RATIO
     try:
         free = shutil.disk_usage(Path(plan.out_dir) if Path(plan.out_dir).exists() else Path(plan.out_dir).anchor).free
     except Exception:
@@ -296,4 +315,4 @@ def estimates(plan: RunPlan, n_pixels: int, dev_min_us: int, dev_max_us: int,
                 dark_ladder_ms=[u / 1000 for u in dl], data_bytes=total,
                 bursts=bursts, burst_int_ms=b_int / 1000, burst_scans=int(burst_scans),
                 dark_session_s=dark_session_seconds(dl, plan.dark_s_per_int), dark_scans_total=int(dark_scans),
-                data_gb_uncompressed=total / 1e9, disk_free_gb=free / 1e9)
+                data_gb_uncompressed=total / 1e9, data_bytes_expected=expected, data_gb_expected=expected / 1e9, disk_free_gb=free / 1e9)

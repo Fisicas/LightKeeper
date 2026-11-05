@@ -39,11 +39,11 @@ from .link import RecorderLink  # noqa: E402
 from .procs import (app_home, entry_args, live_sessions, needs_watching, open_runs, read_json, set_window_holds, spawn_detached,  # noqa: E402
                     supervisor_alive, watched_runs, watchdog_off,  # noqa: E402
                     write_json_atomic)
-from .schedule import (SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, next_clock_time,  # noqa: E402
+from .schedule import (SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, next_clock_time, old_acquisition_defaults,  # noqa: E402
                        next_label, old_default_times, solar_day, sun_events)
 from .storage import LOCAL_TZ, local_dt  # noqa: E402
 
-from . import hotpix, runview, theme  # noqa: E402
+from . import hotpix, runview, theme, weather  # noqa: E402
 from .theme import BLUE, GREEN, LAMP, LINE, ORANGE, RED, SURFACE, TEXT, TEXT2, TEXT3, VIOLET  # noqa: E402
 
 # legacy colour names used by the drawing code, mapped onto the theme tokens
@@ -291,7 +291,7 @@ class Window(Q.QMainWindow):
         self.run_dir = None; self.plan = None; self.run_plan = None; self.run_times = None; self.cal = {}; self.cal_result = None; self.n_bursts = 0; self._last_ts_draw = 0.0
         self._dialog = False; self._last_live = 0; self._scan_new = False
         self._scrub_t = None; self._usable_cache = (None, 0); self._recent_shown = None; self._wf_shown = None
-        self._applying_setup = False; self._setup_from = None
+        self._applying_setup = False; self._setup_from = None; self._wx_log = []
         self.viewing = None; self._load = None; self.link = None; self._expect_attach = None; self._closed_run = False; self._a1_ylim = None; self._last_attach_try = 0.0
         # like OceanView: open the first attached spectrometer and show single 100 ms scans, without pressing Connect.
         # Off after the user disconnects; a device that failed to open is not retried until the attached set changes.
@@ -299,6 +299,8 @@ class Window(Q.QMainWindow):
         self._build()
         self.exp_mode.setCurrentIndex(1); self.int_spin.setValue(LIVE_START_MS)
         self._apply_previous_setup()
+        if self.cb_weather.isChecked():
+            QtCore.QTimer.singleShot(8000, self._weather_sweep)     # runs that closed while no window was open
         self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self._poll); self.timer.start(50)
         self.slow = QtCore.QTimer(self); self.slow.timeout.connect(self._slow_tick); self.slow.start(1000)
         if not self._try_attach():
@@ -487,6 +489,7 @@ class Window(Q.QMainWindow):
         self.a_open_run = m.addAction("Open run folder", lambda: self.run_dir and os.startfile(self.run_dir))
         m.addAction("Resume an unfinished run…", self._resume_dialog)
         m.addAction("Open a recorded run (read-only)…", self._open_recorded_run)
+        m.addAction("Fetch weather for a run…", self._weather_dialog)
         self.a_close_rec = m.addAction("Close the recorded run", self._close_recorded_run); self.a_close_rec.setEnabled(False)
         m.addSeparator()
         m.addAction("Open log folder", lambda: os.startfile(str(app_home() / "logs")))
@@ -607,12 +610,24 @@ class Window(Q.QMainWindow):
         self.backoff_row = hbox(self.backoff_step, "steps down to", self.backoff_min, stretch_first=False)
         f.addRow("Back off", self.backoff_row)
         self.run_exp.currentIndexChanged.connect(lambda i: self.backoff_row.setEnabled(i == 0))
-        self.burst_every = dspin(0, 1440, 60, 0, 15, "min"); self.burst_off = dspin(0, 1439, 30, 0, 5, "min")
+        self.burst_every = dspin(0, 1440, 15, 0, 15, "min"); self.burst_off = dspin(0, 1439, 7, 0, 5, "min")
         self.burst_every.setToolTip("0 = no bursts")
-        f.addRow("Burst every", hbox(self.burst_every, "at minute", self.burst_off, stretch_first=False))
-        self.burst_s = dspin(1, 3600, 120, 0, 10, "s"); self.burst_int = dspin(1, 1000, 50, 0, 1, "ms")
-        self.burst_int.setToolTip("The burst's own integration time; it gets its own dark (never longer than the slot time in use)")
-        f.addRow("Burst length", hbox(self.burst_s, "at", self.burst_int, stretch_first=False))
+        self.burst_row1 = hbox(self.burst_every, "at minute", self.burst_off, stretch_first=False)
+        f.addRow("Burst every", self.burst_row1)
+        self.burst_s = dspin(1, 3600, 60, 0, 10, "s"); self.burst_int = dspin(1, 1000, 50, 0, 1, "ms")
+        self.burst_int.setToolTip("The burst's own integration time; it gets its own dark (never longer than the slot time in use). "
+                                  "When it reaches the slot time, the slots go on through the burst with no gap.")
+        self.burst_row2 = hbox(self.burst_s, "at", self.burst_int, stretch_first=False)
+        f.addRow("Burst length", self.burst_row2)
+        self.burst_min = dspin(-100000, 60000, 0, 0, 100, "counts")
+        self.burst_min.setToolTip("Skip a burst when the raw p99.5 predicted for it is below this. Raw counts sit below zero at night "
+                                  "(about -100 at 10 ms), so 0 is about 100 counts above dark. Skips are logged.")
+        f.addRow("Burst minimum", self.burst_min)
+        self.cb_all = Q.QCheckBox("Save every frame")
+        self.cb_all.setToolTip("Keep every individual spectrum of the whole run, not only those in bursts. At 10 ms this is about "
+                               "20 GB a day after compression. Scheduled bursts are not needed then.")
+        self.cb_all.toggled.connect(lambda on: (self.burst_row1.setEnabled(not on), self.burst_row2.setEnabled(not on), self.burst_min.setEnabled(not on)))
+        f.addRow("", self.cb_all)
         self.cb_pre = Q.QCheckBox("Before"); self.cb_post = Q.QCheckBox("After")
         self.cb_pre.setChecked(True); self.cb_post.setChecked(True)
         f.addRow("Dark sets", hbox(self.cb_pre, self.cb_post, stretch_first=False))
@@ -622,7 +637,7 @@ class Window(Q.QMainWindow):
         self.adv = Q.QWidget(); av = Q.QVBoxLayout(self.adv); av.setContentsMargins(0, 0, 0, 0); f = form(av)
         self.ladder_edit = Q.QLineEdit(",".join(f"{x:g}" for x in DEFAULT_LADDER_MS)); self.ladder_edit.setCursorPosition(0)
         self.ladder_edit.setToolTip("Integration times (ms) auto-exposure may use; every one gets a dark set"); f.addRow("Ladder, ms", self.ladder_edit)
-        self.dark_s = dspin(0.1, 60, 5, 1, 1, "s"); f.addRow("Dark time each", self.dark_s)
+        self.dark_s = dspin(0.1, 120, 30, 1, 1, "s"); f.addRow("Dark time each", self.dark_s)
         self.long_dark = dspin(0, 60000, 3000, 0, 100, "ms")
         self.long_dark.setToolTip("Fixed exposure also takes darks at this time, so the dark-drift model has the dark current at "
                                   "two integration times. 0 = off.")
@@ -640,6 +655,13 @@ class Window(Q.QMainWindow):
         self.cb_logon = Q.QCheckBox("Resume after a Windows restart"); self.cb_logon.setChecked(True)
         self.cb_logon.setToolTip("At the next logon. A per-run entry in HKCU\\...\\Run, removed when the run closes or is interrupted on purpose.")
         f.addRow("", self.cb_logon)
+        self.cb_weather = Q.QCheckBox("Fetch public weather after a run closes")
+        self.cb_weather.setToolTip("Writes weather_vNN.json beside the run, after recording, so it cannot affect an acquisition. This "
+                                   "sends the site, rounded to two decimals, and the dates to Open-Meteo and the US National Weather "
+                                   "Service, and a nearby airport code to the Iowa Environmental Mesonet.")
+        self.cb_weather.setChecked(self.settings.value("fetch_weather", False, type=bool))
+        self.cb_weather.toggled.connect(lambda on: self.settings.setValue("fetch_weather", on))
+        f.addRow("", self.cb_weather)
         lay.addWidget(self.adv); self.adv.setVisible(False)
         self.btn_adv.toggled.connect(lambda on: (self.adv.setVisible(on), self.btn_adv.setText("Hide advanced settings" if on else "Show advanced settings")))
         lay.addStretch(1)
@@ -667,10 +689,10 @@ class Window(Q.QMainWindow):
         for wdg in (self.start_edit, self.stop_edit):
             wdg.dateTimeChanged.connect(self._update_schedule)
         for wdg in (self.slot_spin, self.min_spin, self.max_spin, self.burst_every, self.burst_off, self.burst_s, self.burst_int, self.dark_s,
-                    self.run_int, self.long_dark, self.backoff_step, self.backoff_min):
+                    self.run_int, self.long_dark, self.backoff_step, self.backoff_min, self.burst_min):
             wdg.valueChanged.connect(self._update_schedule)
         self.run_exp.currentIndexChanged.connect(self._update_schedule)
-        for wdg in (self.cb_sd, self.cb_pre, self.cb_post):
+        for wdg in (self.cb_sd, self.cb_pre, self.cb_post, self.cb_all):
             wdg.toggled.connect(self._update_schedule)
         self.ladder_edit.editingFinished.connect(self._update_schedule)
         self._schedule_rows()
@@ -698,14 +720,18 @@ class Window(Q.QMainWindow):
             put("setup_photo", lambda v: self.photo_edit.setText(v if v and Path(v).exists() else ""))
             for k, s in (("slot_s", self.slot_spin), ("int_ms", self.run_int), ("min_int_ms", self.min_spin), ("max_int_ms", self.max_spin),
                          ("backoff_step_ms", self.backoff_step), ("backoff_min_ms", self.backoff_min), ("burst_every_min", self.burst_every),
-                         ("burst_offset_min", self.burst_off), ("burst_s", self.burst_s), ("burst_max_int_ms", self.burst_int),
+                         ("burst_offset_min", self.burst_off), ("burst_s", self.burst_s), ("burst_max_int_ms", self.burst_int), ("burst_min_counts", self.burst_min),
                          ("dark_s_per_int", self.dark_s), ("long_dark_ms", self.long_dark), ("site_lat", self.lat), ("site_lon", self.lon)):
                 put(k, lambda v, s=s: s.setValue(float(v)))
             put("auto_exposure", lambda v: self.run_exp.setCurrentIndex(1 if v else 0))
             put("ladder_ms", lambda v: self.ladder_edit.setText(",".join(f"{float(x):g}" for x in v)))
             for k, c in (("edc", self.cb_edc), ("nlc", self.cb_nlc), ("store_sd", self.cb_sd), ("pre_darks", self.cb_pre),
-                         ("post_darks", self.cb_post), ("auto_resume_logon", self.cb_logon)):
+                         ("post_darks", self.cb_post), ("auto_resume_logon", self.cb_logon), ("save_all_frames", self.cb_all)):
                 put(k, lambda v, c=c: c.setChecked(bool(v)))
+            if old_acquisition_defaults(last.get("app", ""), p):      # old defaults, not a choice: the new ones apply from here on
+                self.burst_every.setValue(15); self.burst_off.setValue(7); self.burst_s.setValue(60); self.dark_s.setValue(30); self.burst_min.setValue(0)
+                if float(p.get("backoff_min_ms", 0)) >= float(p.get("int_ms", 0)):    # a back-off with nowhere to go does nothing
+                    self.backoff_step.setValue(0)
             # the schedule: the same choice of start and stop, with the dates worked out afresh
             old_start, old_stop = old_default_times(last.get("app", ""), p)
             now = dt.datetime.now(LOCAL_TZ); to_q = lambda t: QtCore.QDateTime(QtCore.QDate(t.year, t.month, t.day), QtCore.QTime(t.hour, t.minute))  # noqa: E731
@@ -1042,14 +1068,17 @@ class Window(Q.QMainWindow):
     def _last_runs(self, label):
         """(newest run's metadata, newest run's metadata with the same label) in the Save in folder, or None."""
         metas = []
-        try:
-            for d in Path(self.out_edit.text()).iterdir():
-                m = read_json(d / "run_metadata.json") if d.is_dir() else None
-                if m and m.get("planned_start_local"):
-                    m["_folder"] = d.name
-                    metas.append(m)
-        except Exception:
-            return None, None
+        for root in (self.out_edit.text(), str(self.settings.value("setup_fallback_dir", "") or "")):   # after moving to an empty folder
+            try:
+                for d in Path(root).iterdir() if root else ():
+                    m = read_json(d / "run_metadata.json") if d.is_dir() else None
+                    if m and m.get("planned_start_local"):
+                        m["_folder"] = d.name
+                        metas.append(m)
+            except Exception:
+                pass
+            if metas:
+                break
         metas.sort(key=lambda m: m["planned_start_local"])
         same = [m for m in metas if m.get("plan", {}).get("label") == label]
         return (metas[-1] if metas else None), (same[-1] if same else None)
@@ -1071,6 +1100,8 @@ class Window(Q.QMainWindow):
             lvl = "warn" if e["burst_int_ms"] > (e["ladder_ms"][0] if plan.auto_exposure else plan.int_ms) else "ok"
             out.append((lvl, f"{len(e['bursts'])} bursts at {e['burst_int_ms']:g} ms, with their own {e['burst_int_ms']:g} ms dark"
                              + (" (longer than the shortest slot time)" if lvl == "warn" else "")))
+        if plan.save_all_frames:
+            out.append(("ok", f"Every frame saved: about {e['data_gb_expected']:.0f} GB for this run"))
         if not (plan.pre_darks or plan.post_darks):
             out.append(("bad", "No dark sets planned"))
         elif len(dl) < 2:
@@ -1099,10 +1130,12 @@ class Window(Q.QMainWindow):
             out.append(("warn" if abs(off) > clock.WARN_OFFSET_S else "ok", f"Clock offset {off:+.2f} s"))
         else:
             out.append(("warn", "Clock not checked (no network?)"))
-        need, free = e.get("data_bytes", 0) / 1e9, e["disk_free_gb"]
+        need, free = e.get("data_bytes_expected", 0) / 1e9, e["disk_free_gb"]
         if free == free:                     # not NaN
             out.append(("bad" if need > free else "warn" if need > 0.5 * free else "ok",
                         f"Disk: about {need:.2f} GB needed, {free:.0f} GB free"))
+        else:
+            out.append(("bad", f"Disk: the drive for {plan.out_dir} was not found. Is it connected?"))
         last, same = self._last_runs(plan.label)
         if last:
             lp = last.get("plan", {})
@@ -1156,7 +1189,8 @@ class Window(Q.QMainWindow):
                        min_int_ms=self.min_spin.value(), max_int_ms=self.max_spin.value(), ladder_ms=ladder,
                        edc=self.cb_edc.isChecked(), nlc=self.cb_nlc.isChecked(), store_sd=self.cb_sd.isChecked(),
                        burst_every_min=self.burst_every.value(), burst_offset_min=self.burst_off.value(), burst_s=self.burst_s.value(),
-                       burst_max_int_ms=self.burst_int.value(), dark_s_per_int=self.dark_s.value(), pre_darks=self.cb_pre.isChecked(),
+                       burst_max_int_ms=self.burst_int.value(), burst_min_counts=self.burst_min.value(), save_all_frames=self.cb_all.isChecked(),
+                       dark_s_per_int=self.dark_s.value(), pre_darks=self.cb_pre.isChecked(),
                        post_darks=self.cb_post.isChecked(), site_lat=self.lat.value(), site_lon=self.lon.value(),
                        auto_resume_logon=self.cb_logon.isChecked(), diffuser_id=self.diff_edit.text().strip(),
                        window_state=self.window_cb.currentText(), setup_photo=self.photo_edit.text().strip(),
@@ -1192,10 +1226,10 @@ class Window(Q.QMainWindow):
                f"{'  (' + plan.start_event + f' {plan.start_offset_min:+g} min)' if plan.start_event and not plan.start_now else ''}\n"
                f"{'Stop event: ' + plan.stop_event + f' {plan.stop_offset_min:+g} min' + chr(10) if plan.stop_event else ''}"
                f"Stop: {e['stop']:%Y-%m-%d %H:%M}  ({e['duration_h']:.2f} h, {e['slots']:,} slots of {plan.slot_s:g} s)\n"
-               f"Bursts: {len(e['bursts'])} × {plan.burst_s:g} s at {e['burst_int_ms']:g} ms\n"
+               + ("Every frame saved\n" if plan.save_all_frames else f"Bursts: {len(e['bursts'])} × {plan.burst_s:g} s at {e['burst_int_ms']:g} ms\n") +
                f"Exposure: {'automatic, ' + ', '.join(f'{x:g}' for x in e['ladder_ms']) + ' ms' if plan.auto_exposure else 'fixed at ' + format(plan.int_ms, 'g') + ' ms' + _backoff_txt(plan)}\n"
                f"Dark sets: {'pre ' if plan.pre_darks else ''}{'post' if plan.post_darks else ''} · ~{e['dark_session_s']:.0f} s each at {', '.join(f'{x:g}' for x in e['dark_ladder_ms'])} ms\n"
-               f"Estimated data: {e['data_gb_uncompressed']:.2f} GB (free {e['disk_free_gb']:.0f} GB)")
+               f"Estimated data: about {e['data_gb_expected']:.2f} GB (free {e['disk_free_gb']:.0f} GB)")
         checks = self._preflight(plan, e)
         sym = {"ok": "✔", "warn": "⚠", "bad": "✖"}
         txt += "\n\nPre-flight checks\n" + "\n".join(f"{sym[lv]}  {t}" for lv, t in checks)
@@ -1358,6 +1392,8 @@ class Window(Q.QMainWindow):
                 self._set_setup_visible(self.settings.value("setup_visible", True, type=bool), remember=False)
                 self.run_plan = None; self.run_times = None; self._update_schedule()
                 self._apply_previous_setup()        # the next run follows from the one that just closed
+                if self.cb_weather.isChecked():
+                    self._fetch_weather([e["dir"]])
             elif t == "lamp_result":
                 self.cal[e["kind"]] = e; self._log(f"calibration {e['kind']}: {e['n']} scans at {e['int_us'] / 1000:g} ms")
                 if e["kind"] == "lamp":
@@ -1499,7 +1535,32 @@ class Window(Q.QMainWindow):
         except Exception:
             pass
 
+    def _fetch_weather(self, dirs):
+        """On its own thread: the network never holds up this window, and the recorder is a separate process."""
+        def job():
+            for d in dirs:
+                try:
+                    p = weather.fetch_for_run(d)
+                    self._wx_log.append(f"weather saved: {p}")
+                except Exception as e:
+                    self._wx_log.append(f"weather not fetched for {Path(d).name}: {e}")
+        threading.Thread(target=job, daemon=True, name="LightKeeperWeather").start()
+
+    def _weather_sweep(self):
+        dirs = weather.missing_runs(self.out_edit.text())
+        if dirs:
+            self._log(f"fetching weather for {', '.join(d.name for d in dirs)}")
+            self._fetch_weather(dirs)
+
+    def _weather_dialog(self):
+        d = Q.QFileDialog.getExistingDirectory(self, "Fetch weather for this run folder", self.out_edit.text())
+        if d:
+            self._log(f"fetching weather for {Path(d).name} (sends the site, rounded to two decimals, and the dates)")
+            self._fetch_weather([d])
+
     def _slow_tick(self):
+        while self._wx_log:
+            self._log(self._wx_log.pop(0))
         self.clock.setText(dt.datetime.now(LOCAL_TZ).strftime("%H:%M:%S"))
         holds = self.link is None and self.engine.state != "DISCONNECTED"
         if holds != self._holds_device:
@@ -1925,7 +1986,7 @@ class Window(Q.QMainWindow):
                 ("Dark sets", f"{' and '.join(x for x, on in (('before', plan.pre_darks), ('after', plan.post_darks)) if on) or 'none'}, "
                               f"about {e['dark_session_s']:.0f} s each ({e['dark_scans_total']:,} scans)"),
                 ("Bursts", f"{len(e['bursts'])} of {plan.burst_s:g} s at {e['burst_int_ms']:g} ms" + (f": {bursts}" if bursts else "")),
-                ("Data", f"About {e['data_gb_uncompressed']:.2f} GB uncompressed; {e['disk_free_gb']:.0f} GB free"),
+                ("Data", f"About {e['data_gb_expected']:.2f} GB; {e['disk_free_gb']:.0f} GB free"),
                 ("Site", site_text(plan.site_lat, plan.site_lon) + (
                     f"<br><span style='color:{ORANGE}'>{site_problem(plan.site_lat, plan.site_lon)} "
                     f"Set it under Show advanced settings.</span>" if site_problem(plan.site_lat, plan.site_lon) else ""))]

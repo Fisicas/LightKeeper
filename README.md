@@ -26,7 +26,8 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
 - **Sun-event scheduling.** Start and stop can be tied to astronomical, nautical or civil dawn and dusk, or to sunrise
   and sunset, each with an offset. The NOAA/Meeus solar position is used. Times are fixed when you press Start, and
   daylight-saving changes during a run are handled.
-- **Fast bursts.** At scheduled times, every scan is stored at a short integration time. Bursts that would be too dim
+- **Fast bursts.** At scheduled times, every scan is stored at a short integration time. At the slot's own time the 1 s record
+  goes on through the burst with no gap, and **Save every frame** keeps every spectrum of a run. Bursts that would be too dim
   to be useful are skipped and logged.
 - **Survives the real world.**
   - A supervisor restarts a crashed recorder and resumes the run as a new segment.

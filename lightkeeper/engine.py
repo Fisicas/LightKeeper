@@ -6,7 +6,7 @@ States
   DARK          dark set in progress (input must be covered)      LAMP  calibration acquisition
   AWAIT_UNCOVER pre-run darks done; waiting for the user to uncover the input and press Continue
   STANDBY       run armed, live view, waiting for the scheduled start (nothing stored)
-  RECORDING     storing one row per time slot             BURST  storing every scan (fast burst)
+  RECORDING     storing one row per time slot             BURST  storing every scan as well (fast burst)
   POST_RUN      recording finished; live view; waiting for post-run darks (or Skip)
 Commands (tuples): connect(id, edc, nlc) | connect_serial(serial, edc, nlc, hint_id) | disconnect | preview(on, auto, int_ms)
                    lamp(kind, int_ms, n, lamp_name) | start(plan_dict) | resume(run_dir) | continue | stop | post_dark
@@ -16,12 +16,15 @@ Run journal (0.2.0): run_state.json in the run folder is rewritten atomically at
 Each resumed stretch of recording is a new 'segment' (column in the blocks table); gaps are logged in events.csv.
 Darks cannot be taken during a run (the input cannot be covered), so a run brackets itself with dark sets over the
 WHOLE integration-time ladder it may use: before the start (pre) and after the stop (post).
+Two kinds of burst (0.3.13): at the slot's own integration time the slots simply go on and every frame is saved too (an inline
+raw window: no gap in 'blocks', no exposure command, no discarded frames); at another time, slots pause as before (_burst).
 """
 from __future__ import annotations
 
 import ctypes
 import datetime as dt
 import json
+import math
 import platform
 import queue
 import shutil
@@ -51,7 +54,11 @@ AE_WINDOW_NM = (400.0, 1050.0)
 DISCARD = 2
 FORMAT_VERSION = 2               # 0.3.1: HDF5/run_metadata format; 0.1.0 files have no attribute = format 1
 CLOCK_EVERY_NS = 3600 * 10 ** 9
-BURST_MIN_FILL = 0.01             # skip a burst whose predicted p99.5 is below this fraction of SAT_LEVEL
+STREAM_MIN_FRAMES = 8             # with at least this many frames per slot the frame loop never idles (see _record_slot)
+GIL_SWITCH_S = 0.001              # how long the file thread can keep the frame loop waiting for Python (default 5 ms)
+RAW_SUBMIT_FRAMES = 400           # hand frames to the file thread this often: one chunk at a time cost no frames in tests, 200 did
+WRITE_BACKLOG_BYTES = 512 * 2 ** 20   # acquisition pauses, logged, if the disk falls this far behind; rows are never dropped
+MAX_HOT_PIXEL_SCANS = 200         # scans kept in memory for the hot-pixel search of a long dark set
 
 
 def _backoff_meta(plan):
@@ -123,12 +130,13 @@ class Engine(threading.Thread):
 
     # ---------------------------------------------------------------- thread main
     def run(self):
+        sys.setswitchinterval(GIL_SWITCH_S)
         while not self._quit:
             try:
                 self._drain()
                 if self.dev is None or self.state in ("IDLE", "DISCONNECTED"):
                     time.sleep(0.03); continue
-                if self.state == "RECORDING":
+                if self.state in ("RECORDING", "BURST"):
                     self._record_slot()
                 elif self.state in ("PREVIEW", "STANDBY", "POST_RUN", "AWAIT_UNCOVER"):
                     y = self._scan()
@@ -335,7 +343,7 @@ class Engine(threading.Thread):
                 got = self._set_int(us, "dark set", log=False); acc = 0
                 for _ in range(cnt):
                     y = self._scan(); acc = acc + y; done += 1
-                    if k == 0:
+                    if k == 0 and len(scans) < MAX_HOT_PIXEL_SCANS:
                         scans.append(y)
                     self.emit_scan(y)
                     self.emit("progress", what=f"dark set {got / 1000:g} ms", frac=done / sum(counts))
@@ -402,7 +410,11 @@ class Engine(threading.Thread):
         temp_src = getattr(self.dev, "temperature_source", "")
         meta = dict(app=f"LightKeeper {VERSION}", python=sys.version, platform=platform.platform(), numpy=np.__version__,
                     h5py=h5py.__version__, plan=plan.to_dict(), device=info, ladder_us=lad, dark_ladder_us=dl,
-                    burst_int_us=burst_us(plan, self.dev.min_us, self.dev.max_us),
+                    burst_int_us=min(burst_us(plan, self.dev.min_us, self.dev.max_us), max(lad)),     # 0.3.13: the time bursts use
+                    burst_requested_int_us=burst_us(plan, self.dev.min_us, self.dev.max_us),
+                    raw_frames=dict(save_all_frames=plan.save_all_frames,
+                                    inline_when="the burst time equals the slot time: slots go on, and each of those slots "
+                                                "summarizes frames that are also stored in 'burst'; do not count them twice"),
                     temperature_source=temp_src or "none (no readable sensor on this device)",
                     planned_start_local=t_start.isoformat(), planned_stop_local=t_stop.isoformat(),
                     sun_events_local={k: (v.isoformat() if v else None) for k, v in sun_events(
@@ -427,10 +439,11 @@ class Engine(threading.Thread):
                      nlc=str(info.get("nonlinearity_correction")), format_version=FORMAT_VERSION,
                      **{k: getattr(plan, k) for k in SETUP_FIELDS})
         self.ctx = dict(plan=plan, dir=run_dir, meta=meta, events=Events(run_dir / "events.csv"),
-                        writer=Writer(run_dir, self.dev.wavelengths, attrs, plan.rotate_min, plan.flush_s),
+                        writer=Writer(run_dir, self.dev.wavelengths, attrs, plan.rotate_min, plan.flush_s, block_rows=round(plan.flush_s / plan.slot_s)),
                         t_start=t_start, t_stop=t_stop, ladder=lad, dark_ladder=dl, used_us=set(), n_slots=0, n_sat=0, burst_id=0,
-                        dark_session=0, bursts=burst_times(plan, t_start, t_stop), stop_req=False,
+                        dark_session=0, bursts=[] if plan.save_all_frames else burst_times(plan, t_start, t_stop), stop_req=False,
                         segment=0, dark_sets=[], pre_done=False, last_slot_ns=None, uncovered=False, temp=bool(temp_src))
+        self.ctx["events"].defer = self.ctx["writer"].defer
         self.auto = plan.auto_exposure
         self.backoff = _backoff_meta(plan) is not None; self.low_count = 0
         self.emit("run", dir=str(run_dir), plan=plan.to_dict(), ladder_us=lad, t_start=t_start.isoformat(), t_stop=t_stop.isoformat())
@@ -500,11 +513,13 @@ class Engine(threading.Thread):
         c = self.ctx
         if c is None:
             return
+        self._close_raw()
         c["writer"].maybe_flush(force=True)
         self.log("interrupted", why)
         c["meta"].setdefault("interruptions", []).append(dict(local=iso_local(wall_ns()), phase=self.state, why=why))
         (c["dir"] / "run_metadata.json").write_text(json.dumps(c["meta"], indent=1, default=str))
         self._save_state(status="interrupted")
+        self._close_writer()
         self.emit("run_interrupted", dir=str(c["dir"]))
         self.ctx = None
         prevent_sleep(False)
@@ -517,18 +532,39 @@ class Engine(threading.Thread):
             return
         if status is not None:
             c["status"] = status
+        rows, files = c["writer"].snapshot()
         st = dict(app=f"LightKeeper {VERSION}", status=c.get("status", "open"), phase=self.state, run_dir=str(c["dir"]),
                   serial=c["meta"].get("device", {}).get("serial", ""), planned_start_local=c["t_start"].isoformat(),
                   planned_stop_local=c["t_stop"].isoformat(), segment=c["segment"], last_slot_wall_ns=c["last_slot_ns"],
                   last_slot_local=iso_local(c["last_slot_ns"]) if c["last_slot_ns"] else None, n_slots=c["n_slots"],
                   n_sat=c["n_sat"], burst_id=c["burst_id"], dark_session=c["dark_session"], dark_sets=c["dark_sets"],
                   pre_done=c["pre_done"], uncovered=c["uncovered"], int_us=int(self.dev.int_us) if self.dev else None,
-                  used_us=sorted(c["used_us"]), rows=c["writer"].rows, files=c["writer"].files,
-                  updated_local=iso_local(wall_ns()))
+                  used_us=sorted(c["used_us"]), rows=rows, files=files, updated_local=iso_local(wall_ns()))
+        path = c["dir"] / "run_state.json"
+        if status is None and self.state in ("RECORDING", "BURST"):   # the file thread, in order with the data it describes
+            c["writer"].defer(lambda: write_json_atomic(path, st), retry=False)
+            return
         try:
-            write_json_atomic(c["dir"] / "run_state.json", st)
+            c["writer"].worker.drain(30)                              # an earlier queued state must not land on top of this one
+            write_json_atomic(path, st)
         except Exception as e:  # never let bookkeeping stop acquisition
             self.emit("error", text=f"run_state.json not written: {e!r}")
+
+    def _save_meta(self):
+        """run_metadata.json as it is now; on the file thread while recording, so a slow disk does not cost frames."""
+        c = self.ctx
+        path, text = c["dir"] / "run_metadata.json", json.dumps(c["meta"], indent=1, default=str)
+        if self.state in ("RECORDING", "BURST"):
+            c["writer"].defer(lambda: path.write_text(text), retry=False)
+        else:
+            c["writer"].worker.drain(30)
+            path.write_text(text)
+
+    def _close_writer(self):
+        try:
+            self.ctx["writer"].close()
+        except Exception as e:      # the rows stay queued on the file thread, which keeps trying
+            self.emit("error", text=f"closing the data files: {e!r}")
 
     def _load_darks(self, run_dir: Path, sets: list) -> dict:
         """Mean dark per integration time from the most recent COMPLETE dark session in the run's HDF5 files."""
@@ -574,7 +610,8 @@ class Engine(threading.Thread):
                      nlc=str(info.get("nonlinearity_correction")), format_version=FORMAT_VERSION,
                      **{k: getattr(plan, k) for k in SETUP_FIELDS})
         files = sorted(str(f) for f in run_dir.glob("spectra_*.h5"))
-        w = Writer(run_dir, self.dev.wavelengths, attrs, plan.rotate_min, plan.flush_s, files=files, rows=st.get("rows"))
+        w = Writer(run_dir, self.dev.wavelengths, attrs, plan.rotate_min, plan.flush_s, files=files, rows=st.get("rows"),
+                   block_rows=round(plan.flush_s / plan.slot_s))
         repairs = w.repair(); w.notes.clear()
         now = now_local(); seg = int(st.get("segment", 0)) + 1
         last = st.get("last_slot_wall_ns")
@@ -584,9 +621,11 @@ class Engine(threading.Thread):
                         dark_ladder=dl,
                         temp=bool(getattr(self.dev, "temperature_source", "")) and "none" not in str(meta.get("temperature_source", "none")),
                         n_slots=int(st.get("n_slots", 0)), n_sat=int(st.get("n_sat", 0)), burst_id=int(st.get("burst_id", 0)),
-                        dark_session=int(st.get("dark_session", 0)), bursts=[b for b in burst_times(plan, t_start, t_stop) if b > now],
+                        dark_session=int(st.get("dark_session", 0)),
+                        bursts=[] if plan.save_all_frames else [b for b in burst_times(plan, t_start, t_stop) if b > now],
                         stop_req=False, segment=seg, dark_sets=list(st.get("dark_sets", [])), pre_done=bool(st.get("pre_done")),
                         last_slot_ns=int(last) if last else None, uncovered=bool(st.get("uncovered")), status="open")
+        self.ctx["events"].defer = w.defer
         meta.setdefault("resumes", []).append(dict(segment=seg, resumed_local=iso_local(wall_ns()), previous_phase=st.get("phase"),
                                                    previous_status=st.get("status"), last_slot_local=st.get("last_slot_local"),
                                                    gap_since_last_slot_s=gap_s, app=f"LightKeeper {VERSION}"))
@@ -649,12 +688,14 @@ class Engine(threading.Thread):
                 longest, longest_us = [], got
             for _ in range(n):
                 y = self._scan(); acc = acc + y; done += 1
-                if us == max(lad):
+                if us == max(lad) and len(longest) < MAX_HOT_PIXEL_SCANS:
                     longest.append(y)
                 c["writer"].add("dark_scans", dict(t_wall_ns=np.int64(wall_ns()), int_us=np.int32(got), session=np.int32(sid),
                                                    label=label, spectrum=y.astype(np.float32)))
                 self.emit_scan(y)
                 self.emit("progress", what=f"{label}-run darks {got / 1000:g} ms", frac=done / total)
+                if done % RAW_SUBMIT_FRAMES == 0:
+                    c["writer"].submit()
             self.darks[got] = acc / n
             c["writer"].maybe_flush(force=True)
         if self.dev.simulated:
@@ -697,7 +738,8 @@ class Engine(threading.Thread):
         c.update(slot_ns=slot_ns, m0=m0 + (slot_ns - (w0 % slot_ns)), k=0, overhead_ns=2e6)
         c["used_us"].add(self.dev.int_us)
         c["uncovered"] = True
-        self.log("recording_start", f"segment {c['segment']}; slot {c['plan'].slot_s} s, {len(c['bursts'])} bursts scheduled")
+        self.log("recording_start", f"segment {c['segment']}; slot {c['plan'].slot_s} s, "
+                                    + ("every frame saved" if c["plan"].save_all_frames else f"{len(c['bursts'])} bursts scheduled"))
         self.set_state("RECORDING")
 
     def _record_slot(self):
@@ -707,20 +749,55 @@ class Engine(threading.Thread):
             self._end_recording(); return
         if c["bursts"] and now_local() >= c["bursts"][0]:
             c["bursts"].pop(0); self._burst(); return
+        if w.backlog_bytes() > WRITE_BACKLOG_BYTES and not self._wait_for_disk():
+            return
+        raw = c.get("raw")
+        save = raw is not None or p.save_all_frames; bid = raw["id"] if raw else 0
         s0 = c["m0"] + c["k"] * c["slot_ns"]; s1 = s0 + c["slot_ns"]
-        while mono_ns() < s0:
-            time.sleep(max(0.0, min(0.002, (s0 - mono_ns()) / 1e9)))   # clamp: the clock is read twice (0.1.0 bug: negative sleep)
-        win = self._win(); us = self.dev.int_us
-        acc = 0.0; acc2 = 0.0; n = 0; bmax = 0.0; nsat = 0; tw0 = wall_ns()
+        us = self.dev.int_us
+        # 0.3.13: at short exposures the frame loop never idles, because a frame that finishes while nobody is reading is lost
+        # (hardware: about one per slot at 10 ms). A frame belongs to the slot its return time falls in; the one that returns
+        # past the slot's end is kept as the first frame of the next.
+        stream = us * 1000 * STREAM_MIN_FRAMES <= c["slot_ns"]
+        carry = c.pop("carry", None)
+        if carry is not None and (carry["us"] != us or not s0 - 2000 * us <= carry["m"] < s1):
+            carry = None                 # an exposure change or a jump of the slot grid: not one of this slot's frames
+        if carry is None:
+            while mono_ns() < s0:
+                time.sleep(max(0.0, min(0.002, (s0 - mono_ns()) / 1e9)))   # clamp: the clock is read twice (0.1.0 bug: negative sleep)
+        win = self._win()
+        acc = 0.0; acc2 = 0.0; n = 0; bmax = 0.0; nsat = 0
+        tw0 = wall_ns() if carry is None else max(carry["t"] - us * 1000, c.get("last_end_ns", 0) + 1)
+        tw1 = tw0; late_ns = 0
         while True:
-            if n > 0 and mono_ns() + us * 1e3 + c["overhead_ns"] > s1:
-                break
-            ts = mono_ns(); y = self._scan()
-            c["overhead_ns"] = 0.8 * c["overhead_ns"] + 0.2 * max(0.0, (mono_ns() - ts) - us * 1e3)
+            if stream:
+                if carry is not None:
+                    y, t_ret, m_ret = carry["y"], carry["t"], carry["m"]; carry = None
+                else:
+                    y = self._scan(); m_ret = mono_ns(); t_ret = wall_ns()
+                if n > 0 and m_ret >= s1:
+                    c["carry"] = dict(y=y, t=t_ret, m=m_ret, us=us)
+                    late_ns = max(0, m_ret - s1 - us * 1000)
+                    break
+                tw1 = t_ret
+            else:
+                if n > 0 and mono_ns() + us * 1e3 + c["overhead_ns"] > s1:
+                    break
+                ts = mono_ns(); y = self._scan(); t_ret = wall_ns()
+                c["overhead_ns"] = 0.8 * c["overhead_ns"] + 0.2 * max(0.0, (mono_ns() - ts) - us * 1e3)
+                tw1 = t_ret
             acc = acc + y; acc2 = acc2 + y * y; n += 1
+            if save:
+                w.add("burst", dict(t_wall_ns=np.int64(t_ret), int_us=np.int32(us), burst_id=np.int32(bid), spectrum=y.astype(np.float32)))
+                if raw:
+                    raw["n"] += 1; raw["t1"] = t_ret
+                    raw.setdefault("t0", t_ret)
             m = float(despiked(y[win]).max()); bmax = max(bmax, m); nsat += int(m >= SAT_LEVEL)
             self.emit_scan(y)
-        tw1 = wall_ns()
+        if not stream:
+            tw1 = wall_ns()
+            late_ns = max(0, mono_ns() - s1)
+        c["last_end_ns"] = tw1
         mean = acc / n
         sd = np.sqrt(np.maximum(acc2 / n - mean ** 2, 0) * n / (n - 1)) if n > 1 else np.full(len(mean), np.nan)
         p995 = float(np.percentile(despiked(mean[win]), 99.5))
@@ -728,7 +805,7 @@ class Engine(threading.Thread):
         row = dict(t_wall_ns=np.int64((tw0 + tw1) // 2), t_start_wall_ns=np.int64(tw0), t_end_wall_ns=np.int64(tw1),
                    slot_index=np.int64(c["k"]), segment=np.int16(c["segment"]), int_us=np.int32(us), n_scans=np.int16(n), max_raw_window=np.float32(bmax),
                    p995_mean_window=np.float32(p995), n_saturated_scans=np.int16(nsat),
-                   overrun_ms=np.float32(max(0, mono_ns() - s1) / 1e6), mean=mean.astype(np.float32))
+                   overrun_ms=np.float32(late_ns / 1e6), mean=mean.astype(np.float32))
         if p.store_sd:
             row["sd"] = sd.astype(np.float32)
         temp = None
@@ -740,11 +817,15 @@ class Engine(threading.Thread):
         self.emit("slot", t_ns=int(row["t_wall_ns"]), int_us=us, n=n, bmax=bmax, p995=p995, nsat=nsat, temp_c=temp,
                   mean=mean.astype(np.float32), n_slots=c["n_slots"], n_sat_slots=c["n_sat"], size_mb=w.size_mb(),
                   next_burst=c["bursts"][0].isoformat() if c["bursts"] else "")
-        if self.auto:
+        if raw:                          # one integration time for the whole window; exposure control waits for its end
+            pass
+        elif self.auto:
             self._auto_exposure(bmax, p995)
         elif self.backoff:
             self._backoff(bmax)
         c["k"] = max(c["k"] + 1, int((mono_ns() - c["m0"]) // c["slot_ns"]))
+        if raw and c["k"] >= raw["until_k"]:
+            self._close_raw()
         if mono_ns() - c.get("clock_m", 0) > CLOCK_EVERY_NS:
             self._clock_check("hourly")
         self._drain_clock()
@@ -752,30 +833,79 @@ class Engine(threading.Thread):
             while w.notes:
                 self.log("storage", w.notes.pop(0))
             self._save_state()
+        elif save and w.pending("burst") >= RAW_SUBMIT_FRAMES:
+            w.submit()
+
+    def _wait_for_disk(self) -> bool:
+        """The file thread has fallen far behind (a drive gone or stalled). Acquisition pauses rather than dropping rows or
+        filling the memory; the gap is logged. False if the run ended meanwhile."""
+        c = self.ctx; w = c["writer"]; t0 = mono_ns()
+        self.log("writer_backlog", f"{w.backlog_bytes() / 2 ** 20:.0f} MB not yet written; acquisition paused until the disk catches up")
+        self.emit("error", text="the data disk has fallen behind: acquisition is paused. Check the drive that holds the run.")
+        while w.backlog_bytes() > WRITE_BACKLOG_BYTES / 2 and self.ctx is c and not c["stop_req"] and now_local() < c["t_stop"]:
+            time.sleep(0.2)
+            self._drain()
+        if self.ctx is not c:
+            return False
+        self.log("writer_backlog_end", f"paused {(mono_ns() - t0) / 1e9:.1f} s")
+        c["k"] = max(c["k"], int((mono_ns() - c["m0"]) // c["slot_ns"]) + 1)
+        return not c["stop_req"]
+
+    def _close_raw(self):
+        """End an inline raw window. Frames that do not fill a chunk stay held for the next window, so the file has no holes."""
+        c = self.ctx; r = c.pop("raw", None)
+        if not r:
+            return
+        n = r["n"]; span = (r.get("t1", 0) - r.get("t0", 0)) / 1e9
+        rate = (n - 1) / span if span > 0 else 0.0
+        self.log("burst_end", f"#{r['id']}, {n} scans ({rate:.1f} per s)")
+        c["meta"].setdefault("bursts_done", []).append(dict(id=r["id"], local=iso_local(wall_ns()), int_ms=r["us"] / 1000, scans=n,
+                                                             scans_per_s=round(rate, 2), mode="inline"))
+        c["writer"].submit()
+        self._save_meta()
+        if self.state == "BURST":
+            self.set_state("RECORDING")
 
     def _burst(self):
         c = self.ctx; p = c["plan"]; w = c["writer"]; c["burst_id"] += 1; bid = c["burst_id"]
+        if c.get("raw"):                 # the next burst is due while one is open: one window, frames saved once
+            c["raw"]["until_k"] = max(c["raw"]["until_k"], c["k"] + math.ceil(p.burst_s / p.slot_s))
+            self.log("burst_merged", f"#{bid} joins #{c['raw']['id']}")
+            return
         restore = self.dev.int_us
         us = min(restore, burst_us(p, self.dev.min_us, self.dev.max_us))     # 0.3.8: never snapped onto the slot ladder
         if c.get("last_p995") is not None:
             pred = c["last_p995"] * us / c["last_p995_us"]
-            if pred < BURST_MIN_FILL * SAT_LEVEL:
+            if pred < p.burst_min_counts:
                 self.log("burst_skipped", f"#{bid}, predicted p99.5 {pred:.0f} counts at {us / 1000:g} ms "
-                                          f"(< {BURST_MIN_FILL * SAT_LEVEL:.0f})")
-                c["k"] = int((mono_ns() - c["m0"]) // c["slot_ns"]) + 1
+                                          f"(< {p.burst_min_counts:.0f})")
                 return
+        if us == restore:                # 0.3.13: the same time as the slots, so nothing needs to stop
+            c["raw"] = dict(id=bid, us=us, n=0, until_k=c["k"] + math.ceil(p.burst_s / p.slot_s))
+            self.set_state("BURST", f"#{bid}: {us / 1000:g} ms, {p.burst_s:g} s")
+            self.log("burst_start", f"#{bid}, {us / 1000:g} ms, {p.burst_s:g} s")
+            return
+        c.pop("carry", None)
         self._set_int(us, f"burst {bid}", log=False)
         self.set_state("BURST", f"#{bid}: {us / 1000:g} ms, {p.burst_s:g} s")
         self.log("burst_start", f"#{bid}, {us / 1000:g} ms, {p.burst_s:g} s")
-        t_end = mono_ns() + int(p.burst_s * 1e9); n = 0; w.maybe_flush(force=True)
-        while mono_ns() < t_end and not c["stop_req"]:
-            y = self._scan(); n += 1
-            w.add("burst", dict(t_wall_ns=np.int64(wall_ns()), int_us=np.int32(us), burst_id=np.int32(bid), spectrum=y.astype(np.float32)))
-            self.emit_scan(y)
-            if n % 250 == 0:
-                w.maybe_flush(force=True)
-            self._drain()
-        w.maybe_flush(force=True)
+        t_end = mono_ns() + int(p.burst_s * 1e9); n = 0; w.submit()
+        t_stop_ns = wall_ns() + int((c["t_stop"] - now_local()).total_seconds() * 1e9)
+        try:
+            while mono_ns() < t_end and not c["stop_req"] and wall_ns() < t_stop_ns:
+                y = self._scan(); n += 1
+                w.add("burst", dict(t_wall_ns=np.int64(wall_ns()), int_us=np.int32(us), burst_id=np.int32(bid), spectrum=y.astype(np.float32)))
+                self.emit_scan(y)
+                if n % RAW_SUBMIT_FRAMES == 0:
+                    w.submit()
+                self._drain()
+                if self.ctx is not c:    # interrupted from inside the loop: that path closed the run
+                    return
+        except Exception:                # do not stay at the burst's time, or in BURST
+            self._set_int(restore, "after a failed burst", log=False)
+            self.set_state("RECORDING")
+            raise
+        w.submit()
         self.log("burst_end", f"#{bid}, {n} scans ({n / p.burst_s:.1f} per s)")
         c["meta"].setdefault("bursts_done", []).append(dict(id=bid, local=iso_local(wall_ns()), int_ms=us / 1000, scans=n,
                                                              scans_per_s=round(n / p.burst_s, 2)))
@@ -812,10 +942,11 @@ class Engine(threading.Thread):
                 self.log("clock_check_failed", f"{when}: {r['error']}")
             warn = (not w32) or (r["ok"] and abs(r["offset_s"]) > clock.WARN_OFFSET_S)
             self.emit("clock", ok=r["ok"], offset_s=r.get("offset_s"), rtt_s=r.get("rtt_s"), w32time=w32, warn=warn)
-            (c["dir"] / "run_metadata.json").write_text(json.dumps(c["meta"], indent=1, default=str))
+            self._save_meta()
 
     def _end_recording(self):
         c = self.ctx
+        self._close_raw()
         self._clock_check("stop", sync=True)
         c["writer"].maybe_flush(force=True)
         if "recording_end_local" not in c["meta"] or self.state in ("RECORDING", "BURST"):
@@ -848,7 +979,8 @@ class Engine(threading.Thread):
             self.log("run_summary_failed", repr(e))
         self.log("run_closed", why)
         self._save_state(status="closed")
-        self.emit("run_closed", dir=str(c["dir"]), rows=c["writer"].rows)
+        self._close_writer()
+        self.emit("run_closed", dir=str(c["dir"]), rows=c["writer"].snapshot()[0])
         self.ctx = None
         prevent_sleep(False)
         self.set_state("PREVIEW" if self.dev is not None else "DISCONNECTED")

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.13 (2026-11-04)
+Measured on a Maya2000 Pro at 10 ms, writing to a USB hard drive, and by replaying the whole 4 Nov 2026 run through the new writer.
+- **Frames keep coming.** Bursts at 10 ms now run at 99.85 frames/s (was 97.1), against about 99.88 possible. The longest gap was
+  26 ms (was 120 ms).
+  - **Saving:** a file thread does the writing, so saves no longer stop the frame loop.
+  - **Slot edges:** at 8 or more frames per slot the loop no longer idles until the next slot, which lost about one frame per
+    slot during bursts. A frame belongs to the slot its return time falls in.
+- **No gap in the 1 s record.** A burst at the slot's own integration time keeps the slots going and also saves each frame, with no
+  exposure command and no discarded frames. A burst at another time still pauses the slots.
+  - **Changed:** those slots summarize frames that are also in `burst`, so do not count them twice. `bursts_done` marks them
+    `mode: inline`.
+- **Smaller files, every value kept.** The 4 Nov run takes 1.06 GB instead of 1.50 GB (-30 %), with every stored value identical.
+  - Holes left by appending fell from 13.7 % to 0.2 %: only whole chunks are written, except on a forced flush.
+  - `blocks` arrays gain the shuffle filter. Frames use chunks of 400 rows by 16 pixels, which also makes one pixel through time
+    much faster to read.
+  - Built-in HDF5 filters only; the layout, `format_version` and older files are unchanged.
+  - **Changed:** a crash can lose up to about 8 s of burst frames, held to complete a chunk, as well as about 30 s of slots.
+- **Save every frame.** New option: every individual spectrum of the run. About 21 GB for a 12.6 h day at 10 ms.
+- **A sleeping data drive.** After 2 minutes without a write, the file thread wakes the drive before it opens an HDF5 file, so the
+  spin-up cannot hold up the frame loop. It adds no wait while recording.
+- **Longer short darks.** The cap of 30 scans is now 12,000, so a dark gets the time it is set to. Long darks are unchanged.
+- **New defaults in the window.** Bursts of 60 s every 15 min at minute 7, burst minimum 0 counts, dark time 30 s. A run from before
+  0.3.13 that only holds the old defaults does not pass them on; a choice someone made does.
+- **Burst minimum** is now a setting. Plans from older versions keep 600 counts, including on resume.
+- **Weather.** Optional `weather_vNN.json` beside a run, from `LightKeeper.py --fetch-weather`, the More menu or a tick box. It runs after
+  recording and never in the engine or recorder. The site is rounded to two decimals before it is sent.
+- **Moving the Save in folder.** A `setup_fallback_dir` setting lets the first run in an empty folder copy its setup from the old one.
+  The pre-flight check now fails if the drive for **Save in** is missing.
+- **Fixed:** `burst_int_us` in the metadata reported the requested time, not the time used; the requested time is now
+  `burst_requested_int_us`. A burst now stops at the planned stop time. A failed burst no longer leaves the engine in BURST at the
+  burst's exposure. The data estimate no longer counts bursts in the dark or ignores compression.
+
 ## 0.3.12 (2026-11-04)
 - **A new run starts from the previous run's setup.** When the window opens, and when a run closes, the setup panel is
   filled from the newest run in **Save in**, including the site, diffuser, fiber, schedule and acquisition settings.
