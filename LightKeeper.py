@@ -24,5 +24,5 @@ if __name__ == "__main__":
     if "--fetch-weather" in sys.argv:
         from lightkeeper.weather import main as wx_main
         raise SystemExit(wx_main([a for a in sys.argv[1:] if a != "--fetch-weather"]))
-    from lightkeeper.ui import main
+    from lightkeeper.splash import main       # shows the splash first, then loads the window
     raise SystemExit(main())

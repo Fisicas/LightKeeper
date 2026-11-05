@@ -276,8 +276,11 @@ def dspin(lo, hi, val, dec=1, step=1.0, suffix=""):
 
 
 class Window(Q.QMainWindow):
-    def __init__(self, auto_confirm: bool = False):
+    def __init__(self, auto_confirm: bool = False, progress=None):
+        """progress(step): optional, told what is starting (the splash); events are not processed until the timers below can run."""
         super().__init__()
+        progress = progress or (lambda step: None)
+        progress(1)
         self.setWindowTitle(f"{APP_NAME} {VERSION}"); self.setWindowIcon(icon()); self.resize(1600, 960)
         self.auto_confirm = auto_confirm
         if os.environ.get("LIGHTKEEPER_HOME"):    # tests and portable setups keep their settings beside their app home
@@ -298,9 +301,11 @@ class Window(Q.QMainWindow):
         self._auto = os.environ.get("LIGHTKEEPER_AUTOCONNECT", "1") != "0"; self._auto_live = False; self._auto_failed = None; self._last_auto_try = 0.0
         self._build()
         self.exp_mode.setCurrentIndex(1); self.int_spin.setValue(LIVE_START_MS)
+        progress(2)
         self._apply_previous_setup()
         if self.cb_weather.isChecked():
             QtCore.QTimer.singleShot(8000, self._weather_sweep)     # runs that closed while no window was open
+        progress(3)
         self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self._poll); self.timer.start(50)
         self.slow = QtCore.QTimer(self); self.slow.timeout.connect(self._slow_tick); self.slow.start(1000)
         if not self._try_attach():

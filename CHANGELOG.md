@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.14 (2026-11-05)
+- **Splash screen.** The window now opens with a splash in the style of the project's social card. Each loading step shows a spinning
+  ring while it runs, then a check mark and its time, and the splash closes once the main window is open. A failure while starting now
+  shows a message instead of vanishing silently under `pythonw`. Nothing changes in recording, and the background recorder does not use it.
+
 ## 0.3.13 (2026-11-04)
 Measured on a Maya2000 Pro at 10 ms, writing to a USB hard drive, and by replaying the whole 4 Nov 2026 run through the new writer.
 - **Frames keep coming.** Bursts at 10 ms now run at 99.85 frames/s (was 97.1), against about 99.88 possible. The longest gap was

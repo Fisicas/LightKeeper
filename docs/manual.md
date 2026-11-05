@@ -23,6 +23,7 @@ scan per update), as OceanView does. Spectrometers plugged in later are picked u
 | Area | What it shows |
 |---|---|
 | Header | Run name (hover for the full folder path); the state indicator; the clock; **Hide setup / Show setup** (Ctrl+B); **More** (open run folder, resume an unfinished run, open log folder, about); **Full screen** (F11). |
+| Splash | While the window loads, a row for each step: a spinning ring while it runs, then a check mark and its time. It closes once the main window is open. `--no-splash`, or `LIGHTKEEPER_SPLASH=0`, starts without it. |
 | Metric strip | Slots recorded, integration time, scans per slot, peak counts, saturated slots, bursts, dark sets and data written. On the right: the next event (start countdown, next burst, stop) and the background recorder it is attached to. |
 | Setup panel | Spectrometer; Live view (with **Take dark set…**); Run (label, geometry, notes, folder); Schedule; Acquisition (time slot, integration range, bursts, dark sets). **Show advanced settings** opens the ladder, dark time per integration time, SD storage, site and restart resume. |
 | Time range (Waterfall, Time series) | **Usable daylight (auto)** draws only where the 420–700 nm dark-corrected signal stays above 1 % of the day's bright level for 5 min; **All data** or **Custom** from/to; **Reset** returns to auto. The range drawn is quoted next to it. **Open recorded run…** shows a finished run read-only, dark-corrected with its pre-run dark set. |
