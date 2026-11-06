@@ -275,6 +275,9 @@ def dspin(lo, hi, val, dec=1, step=1.0, suffix=""):
     return s
 
 
+SETUP_MIN_W, SETUP_MAX_W = 392, 520      # the setup panel: wide enough for its content, within reason
+
+
 class Window(Q.QMainWindow):
     def __init__(self, auto_confirm: bool = False, progress=None):
         """progress(step): optional, told what is starting (the splash); events are not processed until the timers below can run."""
@@ -517,9 +520,11 @@ class Window(Q.QMainWindow):
         return f
 
     def _left(self):
-        frame = Q.QFrame(); frame.setObjectName("setup"); frame.setFixedWidth(392)
+        frame = Q.QFrame(); frame.setObjectName("setup"); frame.setFixedWidth(SETUP_MIN_W)
         fv = Q.QVBoxLayout(frame); fv.setContentsMargins(0, 0, 0, 0); fv.setSpacing(0)
         sc = Q.QScrollArea(); sc.setWidgetResizable(True); sc.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # the scroll bar is hidden, but Tab would still scroll sideways to show a focused box, with no way back
+        hbar = sc.horizontalScrollBar(); hbar.valueChanged.connect(lambda v: hbar.setValue(0) if v else None)
         w = Q.QWidget(); sc.setWidget(w); lay = Q.QVBoxLayout(w); lay.setContentsMargins(16, 8, 14, 12); lay.setSpacing(6)
         fv.addWidget(sc, 1)
 
@@ -701,6 +706,9 @@ class Window(Q.QMainWindow):
             wdg.toggled.connect(self._update_schedule)
         self.ladder_edit.editingFinished.connect(self._update_schedule)
         self._schedule_rows()
+        w.ensurePolished()
+        need = w.minimumSizeHint().width() + sc.verticalScrollBar().sizeHint().width() + 2 * sc.frameWidth()
+        frame.setFixedWidth(min(SETUP_MAX_W, max(SETUP_MIN_W, need)))
         return frame
 
     def _apply_previous_setup(self):

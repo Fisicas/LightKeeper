@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.15 (2026-11-05)
+- **Fixed:** pressing Tab in the setup panel could shift its content sideways and cut off the labels, with no way back short of
+  restarting. The panel now fits its content, and sideways scrolling is locked. Tab still scrolls it up and down.
+
 ## 0.3.14 (2026-11-05)
 - **Splash screen.** The window now opens with a splash in the style of the project's social card. Each loading step shows a spinning
   ring while it runs, then a check mark and its time, and the splash closes once the main window is open. A failure while starting now
