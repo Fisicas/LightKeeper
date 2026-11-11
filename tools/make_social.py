@@ -1,6 +1,7 @@
 """Write the README hero / GitHub social preview and the 256 px icon from lightkeeper/icons.py and theme.py.
 
-Outputs docs/images/social-preview.png (1280 x 640) and docs/images/icon-256.png.
+Outputs docs/images/social-preview.png (1280 x 640), docs/images/icon-256.png and LightKeeper.ico (the Windows icon
+for shortcuts, 16 to 256 px, each size drawn from the vector so the small ones stay sharp).
 The faint trace along the bottom is tools/social_trace.csv: a real daylight spectrum (Maya2000 Pro, forest-edge
 diffuser, 1 Nov 2026, hourly median at 1 s integration minus the matched pre-run dark, with the hot pixels flagged in
 the dark set interpolated over, at the native 0.44 nm pixel spacing, normalised), so the image needs no run folder to rebuild.
@@ -9,6 +10,7 @@ Usage:
   python -X utf8 tools/make_social.py
 """
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -25,6 +27,8 @@ from lightkeeper.icons import ICON_SVG  # noqa: E402
 from lightkeeper.theme import LAMP, LINE, SURFACE, TEXT, TEXT2  # noqa: E402
 
 IMAGES = REPO / "docs" / "images"
+ICO = REPO / "LightKeeper.ico"
+ICO_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
 W, H = 1280, 640
 FEATURES = ["Dark sets bracket every run", "Starts and stops on sun events", "Survives crashes, unplugs and restarts"]
 
@@ -35,6 +39,23 @@ def svg_image(size):
     p = QtGui.QPainter(img); p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
     QtSvg.QSvgRenderer(QtCore.QByteArray(ICON_SVG.encode())).render(p); p.end()
     return img
+
+
+def png_bytes(img):
+    buf = QtCore.QBuffer(); buf.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG"); buf.close()
+    return bytes(buf.data())
+
+
+def write_ico(path, sizes=ICO_SIZES):
+    """A multi-size .ico of PNG entries (Windows Vista and later), each size rendered from ICON_SVG."""
+    pngs = [png_bytes(svg_image(s)) for s in sizes]
+    head = struct.pack("<HHH", 0, 1, len(sizes))
+    offset, entries = 6 + 16 * len(sizes), b""
+    for s, data in zip(sizes, pngs):
+        entries += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(data), offset)
+        offset += len(data)
+    Path(path).write_bytes(head + entries + b"".join(pngs))
 
 
 def load_fonts():
@@ -55,6 +76,7 @@ def main():
     load_fonts()
     IMAGES.mkdir(parents=True, exist_ok=True)
     svg_image(256).save(str(IMAGES / "icon-256.png"))
+    write_ico(ICO)
 
     img = QtGui.QImage(W, H, QtGui.QImage.Format.Format_ARGB32_Premultiplied); img.fill(QtGui.QColor("#0e1216"))
     p = QtGui.QPainter(img); p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
@@ -102,7 +124,7 @@ def main():
     c = QtGui.QColor(LAMP); c.setAlpha(190); p.setPen(QtGui.QPen(c, 1.7)); p.setBrush(QtCore.Qt.BrushStyle.NoBrush); p.drawPath(path)
     p.end()
     img.save(str(IMAGES / "social-preview.png"))
-    print("wrote", IMAGES / "social-preview.png", IMAGES / "icon-256.png")
+    print("wrote", IMAGES / "social-preview.png", IMAGES / "icon-256.png", ICO)
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ You need:
   `OCEANDIRECT_HOME` points.
 
 1. **Launch.** Double-click `Launch_LightKeeper.cmd`. It uses `LIGHTKEEPER_PYTHON`, or else the first `pythonw.exe` on PATH.
+   For a Start menu or desktop shortcut, `LightKeeper.ico` in the same folder is the app's icon.
 2. **Live view.** Connect, start the live view, aim the fiber and check the exposure.
 3. **Plan.** Fill in the run: label, site, start and stop, and the setup fields. Then check the **Schedule** tab.
 4. **Start run…** Cover the input for the pre-run dark set. Uncover it when asked, then press **Continue**. The run
@@ -113,7 +114,7 @@ The tests run against the simulator:
 - the 2026 daylight-saving change.
 
 The GUI checks (`tests/gui_recorder_smoke.py`, `tests/gui_schedule_running.py`, `tests/gui_save_spectrum.py`, `tests/gui_time_range.py`, `tests/gui_preflight.py`, `tests/gui_watchdog.py`) are scripts that run off-screen with
-`QT_QPA_PLATFORM=offscreen`. `python -X utf8 tools/make_social.py` rebuilds the social preview and icon.
+`QT_QPA_PLATFORM=offscreen`. `python -X utf8 tools/make_social.py` rebuilds the social preview, the icon and `LightKeeper.ico`.
 
 ## Status
 
