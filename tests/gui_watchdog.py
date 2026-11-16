@@ -58,7 +58,9 @@ w._ask = lambda *a: False
 w._offer_resume()
 check("'Not now' switches the watchdog off for that run", (d / "watchdog_off.json").exists() and not procs.watched_runs())
 w._auto_connect(rescan=True)
-check("and the window may then use the spectrometer", bool(seen))
+# 0.4.2: either it searched USB again, or (with a spectrometer attached) 'Not now' already started a connect, during which
+# the window must not search again
+check("and the window may then use the spectrometer", bool(seen) or w._pending_connect > 0)
 procs.watchdog_clear(d)
 check("a later resume switches it back on", bool(procs.watched_runs()))
 w._auto = False

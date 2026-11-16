@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.2 (2026-11-15)
+- **Full scale.** A new button next to Fit y shows the whole wavelength range. Counts run from 0 to just above the detector's largest
+  count: 64,000 on a Maya2000 Pro, 4,095 on a USB650. The saturation line is always in view, so you can see how much headroom a
+  spectrum has. Full scale holds while the live view updates, and follows counts/s, the log axis and a change of spectrometer.
+  Zooming, Fit y, a double-click or Auto-scale ends it.
+- **Pointer readout.** Pointing at the Spectrum plots or the colour strip shows the wavelength, pixel number and counts there,
+  with no click. The readout has its own line under the toolbar, so long text no longer squeezes the controls.
+- **A more reliable cursor.**
+  - Ticking Cursor turns the toolbar's pan or zoom off; those used to take every click without saying so. If pan or zoom is on
+    when you click, the readout says why the cursor did not move.
+  - Clicks on the colour strip place the cursor too.
+  - The placed cursor's wavelength is printed on the plot, beside the line.
+  - Values are read at exactly the cursor's pixel. A hidden hot or cold pixel is reported as hidden; it used to show the
+    neighbouring pixel's value.
+- **Fixed: two connects could overlap.** The window's once-a-second check could start a second connect, and a USB rescan, while
+  a slow first connect (a Maya through OceanDirect) was still opening the spectrometer. The device was then reopened under the
+  window and the live view did not start. Now nothing else starts until that connect has ended.
+- Tests: `tests/gui_full_scale_cursor.py`, and `tests/hw_window_switch_full_scale.py`, which runs the real window offscreen with a
+  real spectrometer (and the simulator when only one is attached).
+
 ## 0.4.1 (2026-11-15)
 - **Fixed: the splash could stay up for good.** In 0.4.0 the "Choose a spectrometer" question opened while the window was still
   starting. The splash closes only when start-up ends, so it stayed on top and hid the question. Now nothing is asked and no

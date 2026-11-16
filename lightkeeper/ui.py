@@ -98,13 +98,22 @@ class WavelengthCursor:
     def __init__(self, canvas, toolbar, axes, xs, on_move, with_time=False):
         self.canvas, self.toolbar, self.axes, self.xs, self.on_move, self.with_time = canvas, toolbar, axes, xs, on_move, with_time
         self.on = False; self.x = None; self.y = None; self.drag = False; self.lines = []
+        self.hint = ""             # 0.4.2: why the last click did not place the cursor (pan/zoom on), shown by on_move
         canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         for name, fn in (("button_press_event", self._press), ("motion_notify_event", self._motion),
                          ("button_release_event", self._release), ("key_press_event", self._key)):
             canvas.mpl_connect(name, fn)
 
+    def _tool_mode(self) -> str:
+        return str(getattr(self.toolbar, "mode", "") or "")
+
     def enable(self, on):
-        self.on = bool(on); self.drag = False; self.sync(); self.canvas.draw_idle(); self.on_move()
+        """0.4.2: ticking the cursor turns the toolbar's pan or zoom off, which would otherwise take every click."""
+        self.on = bool(on); self.drag = False; self.hint = ""
+        m = self._tool_mode()
+        if self.on and m:
+            (self.toolbar.pan if "pan" in m else self.toolbar.zoom)()
+        self.sync(); self.canvas.draw_idle(); self.on_move()
 
     def sync(self):
         """Draw the lines for the current state. Plots that were cleared have lost theirs, so they are made afresh."""
@@ -116,10 +125,15 @@ class WavelengthCursor:
         self.lines = []
         if not self.on or self.x is None:
             return
-        for a in self.axes():
+        for k, a in enumerate(self.axes()):
             self.lines.append(a.axvline(self.x, color=TEXT, lw=0.8, ls=(0, (3, 2)), gid="cursor", zorder=5))
             if self.with_time and self.y is not None:
                 self.lines.append(a.axhline(self.y, color=TEXT, lw=0.8, ls=(0, (3, 2)), gid="cursor", zorder=5))
+            if k == 0:             # 0.4.2: the wavelength on the plot itself, at the top of the line
+                self.lines.append(a.annotate(f"{self.x:.2f} nm", xy=(self.x, 1.0), xycoords=("data", "axes fraction"),
+                                             xytext=(4, -4), textcoords="offset points", ha="left", va="top", fontsize=8,
+                                             color=TEXT, gid="cursor", zorder=6, annotation_clip=False,
+                                             bbox=dict(boxstyle="round,pad=0.2", fc=SURFACE, ec=LINE, lw=0.6, alpha=0.9)))
 
     def _snap(self, x):
         xs = self.xs()
@@ -132,8 +146,11 @@ class WavelengthCursor:
         self.sync(); self.canvas.draw_idle(); self.on_move()
 
     def _press(self, ev):
-        if not self.on or ev.button != 1 or ev.dblclick or ev.xdata is None or ev.inaxes not in self.axes() or getattr(self.toolbar, "mode", ""):
+        if not self.on or ev.button != 1 or ev.dblclick or ev.xdata is None or ev.inaxes not in self.axes():
             return
+        if self._tool_mode():      # the click belongs to pan/zoom: say so instead of doing nothing
+            self.hint = "Pan or zoom is on: press its toolbar button again to place the cursor"; self.on_move(); return
+        self.hint = ""
         self.canvas.setFocus(); self.drag = True; self._place(ev.xdata, ev.ydata)
 
     def _motion(self, ev):
@@ -306,6 +323,9 @@ class Window(Q.QMainWindow):
         # 0.4.1: questions (resume a run) and opening a spectrometer wait until the splash has closed; a dialog shown under the
         # stay-on-top splash held start-up open, so the splash never closed. No splash (tests): started at once.
         self._on_started = []; self._switching = None
+        # 0.4.2: time a connect was sent; until it ends (IDLE or DISCONNECTED) no second connect and no USB rescan, which
+        # opened devices while the engine was opening one and reconnected it under the window (live view never started)
+        self._pending_connect = 0.0
         self._build()
         self.setAcceptDrops(True); Q.QApplication.instance().installEventFilter(self)
         self.exp_mode.setCurrentIndex(1); self.int_spin.setValue(LIVE_START_MS)
@@ -930,6 +950,11 @@ class Window(Q.QMainWindow):
         r.addWidget(self.cb_auto)
         self.btn_fity = Q.QPushButton("Fit y"); self.btn_fity.setToolTip("Stretch the y-axes to the data in the visible wavelength range")
         self.btn_fity.clicked.connect(self._fit_y_now); r.addWidget(self.btn_fity)
+        self.btn_full = Q.QPushButton("Full scale")
+        self.btn_full.setToolTip("Whole wavelength range, counts from 0 to just above the detector's largest count (64,000 on a "
+                                 "Maya2000 Pro, 4,095 on a USB650), so the saturation line is always in view. It stays at full "
+                                 "scale until you zoom, press Fit y or tick Auto-scale.")
+        self.btn_full.clicked.connect(self._full_scale); r.addWidget(self.btn_full)
         disp = Q.QToolButton(); disp.setText("Display"); disp.setObjectName("flat"); disp.setPopupMode(Q.QToolButton.ToolButtonPopupMode.InstantPopup)
         dm = Q.QMenu(disp)
         self.cb_dark = dm.addAction("Subtract the matched dark"); self.cb_rate = dm.addAction("Counts per second")
@@ -941,6 +966,7 @@ class Window(Q.QMainWindow):
         self.cb_mask.toggled.connect(lambda on: (self.settings.setValue("hide_hot_pixels", on), self._draw_waterfall()))
         dm.addSeparator()
         hint = dm.addAction("Wheel stretches y, Shift+wheel zooms x, Ctrl+wheel both; double-click resets"); hint.setEnabled(False)
+        hint2 = dm.addAction("Pointing at a plot shows the wavelength, pixel and counts there"); hint2.setEnabled(False)
         disp.setMenu(dm); r.addWidget(disp)
         self.btn_save_spec = Q.QPushButton("Save spectrum")
         self.btn_save_spec.setToolTip("Save the scan on screen as it is shown (Ctrl+S): <label>_<date>_<time>.dpt, two columns "
@@ -949,12 +975,14 @@ class Window(Q.QMainWindow):
         self.cb_spec_cur = Q.QCheckBox("Cursor")
         self.cb_spec_cur.setToolTip("Click or drag on a plot to read the wavelength. Arrow keys move one pixel, Shift+arrow ten.")
         r.addWidget(self.cb_spec_cur)
-        self.spec_cur_info = Q.QLabel(""); r.addWidget(self.spec_cur_info)
+        # 0.4.2: the cursor and pointer readout gets its own line under the toolbar (long text must not widen the window)
+        self.spec_cur_info = Q.QLabel(""); self.spec_cur_info.setSizePolicy(Q.QSizePolicy.Policy.Ignored, Q.QSizePolicy.Policy.Fixed)
+        self.spec_cur_info.setFixedHeight(self.spec_cur_info.fontMetrics().height() + 4)
         for c in (self.cb_auto, self.cb_dark, self.cb_rate, self.cb_log, self.cb_mask, self.cb_cal):
             c.toggled.connect(lambda *_: self._draw_live(force=True))
         self.live_info = Q.QLabel(""); self.live_info.setObjectName("secondary"); self.live_info.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.live_info.setSizePolicy(Q.QSizePolicy.Policy.Ignored, Q.QSizePolicy.Policy.Preferred); r.addWidget(self.live_info, 1)   # long text must not widen the window
-        v.addLayout(r); v.addWidget(self.c_spec, 1)
+        v.addLayout(r); v.addWidget(self.spec_cur_info); v.addWidget(self.c_spec, 1)
         tr = Q.QHBoxLayout(); tr.setContentsMargins(8, 0, 8, 2); tr.setSpacing(8)
         self.scrub_first = Q.QLabel(""); self.scrub_first.setObjectName("secondary"); tr.addWidget(self.scrub_first)
         self.scrub = JumpSlider(QtCore.Qt.Orientation.Horizontal); self.scrub.setEnabled(False)
@@ -964,8 +992,13 @@ class Window(Q.QMainWindow):
         v.addLayout(tr)
         self._scrub_timer = QtCore.QTimer(self); self._scrub_timer.setSingleShot(True); self._scrub_timer.setInterval(40)
         self._scrub_timer.timeout.connect(self._draw_recent)
-        self.spec_cursor = WavelengthCursor(self.c_spec, self.spec_tb, lambda: list(self.c_spec.ax), self._cursor_pixels, self._spec_cursor_text)
+        self.spec_cursor = WavelengthCursor(self.c_spec, self.spec_tb, lambda: list(self.c_spec.ax) + [self.ax_strip], self._cursor_pixels,
+                                            self._spec_cursor_text)
         self.cb_spec_cur.toggled.connect(self.spec_cursor.enable)
+        self._hover_i = None; self._live_shown = None; self._recent_full = None; self._full_hold = False
+        self.c_spec.mpl_connect("motion_notify_event", self._spec_hover)
+        self.c_spec.mpl_connect("figure_leave_event", lambda ev: self._spec_hover(None))
+        self.cb_auto.toggled.connect(lambda on: setattr(self, "_full_hold", self._full_hold and not on))
         self.c_spec.mpl_connect("scroll_event", self._on_scroll)
         self.c_spec.mpl_connect("button_press_event", self._on_click)
         self.c_spec.mpl_connect("button_release_event", self._on_release)
@@ -1155,6 +1188,7 @@ class Window(Q.QMainWindow):
 
     def _connect(self):
         if self.state == "DISCONNECTED":
+            self._pending_connect = time.time()
             self.engine.send("connect", self.dev_combo.currentData(), self.cb_edc.isChecked(), self.cb_nlc.isChecked())
         else:
             self._auto = False             # the user chose to let go of the spectrometer: do not grab it again
@@ -1514,6 +1548,8 @@ class Window(Q.QMainWindow):
                 self._on_slot(e)
             elif t == "state":
                 self._set_state(e["state"], e.get("detail", ""))
+                if e["state"] == "IDLE" or (e["state"] == "DISCONNECTED" and self._switching != "closing"):
+                    self._pending_connect = 0.0           # that connect has ended, one way or the other
                 if self._switching == "closing" and e["state"] == "DISCONNECTED":
                     self._switching = "opening"       # the old spectrometer closed; the new one opens next
                 elif self._switching == "opening" and e["state"] == "DISCONNECTED":
@@ -1672,6 +1708,8 @@ class Window(Q.QMainWindow):
         """Connect the first attached Ocean spectrometer (never the simulator) and start the live view."""
         if not self._started or not self._auto or self.link is not None or self._expect_attach is not None or self.state != "DISCONNECTED":
             return
+        if time.time() - self._pending_connect < 60:      # a connect is still on its way
+            return
         if rescan:
             if live_sessions() or watched_runs():   # 0.3.11: a run the watchdog is about to resume needs the spectrometer free
                 return
@@ -1688,6 +1726,7 @@ class Window(Q.QMainWindow):
         pick = self._last_used(real)           # 0.4.1: the spectrometer used last, if attached; else the first found
         self.dev_combo.setCurrentIndex(ids.index(pick)); self._auto_live = tuple(real)
         self._log(f"opening {self.dev_combo.currentText().strip()} automatically; live view at {LIVE_START_MS} ms")
+        self._pending_connect = time.time()
         if len(real) > 1:
             self.statusBar().showMessage(f"{len(real)} spectrometers attached: opened {self.dev_combo.currentText().split('  (')[0].strip()}. "
                                          "Pick another in the Spectrometer list to switch.", 15000)
@@ -1727,7 +1766,7 @@ class Window(Q.QMainWindow):
             return
         self._log(f"switching to {self.dev_combo.itemText(k).strip()}")
         self._auto_live = (dev_id,)           # start the live view again once it is open
-        self._switching = "closing"
+        self._switching = "closing"; self._pending_connect = time.time()
         self.engine.send("connect", dev_id, self.cb_edc.isChecked(), self.cb_nlc.isChecked())
 
     def _resume_dialog(self):
@@ -1902,8 +1941,11 @@ class Window(Q.QMainWindow):
         key = (len(x), float(x[0]), float(x[-1]))
         if force or getattr(self, "_strip_key", None) != key:
             self._strip_key = key; self._draw_strip()
+        self._live_shown = (yy * k, show, "counts/s" if k != 1 else "counts")
         if self.cb_auto.isChecked():
             a0.set_xlim(x[0], x[-1]); self._fit_y(a0)
+        elif self._full_hold:
+            self._apply_full_scale()
         peak = float(np.max(y[show])) if show.any() else 0
         hidden = int((~show).sum())
         self.live_info.setText(f"{us / 1000:g} ms, peak {peak:,.0f} counts, {'matched dark available' if d is not None else 'no matched dark'}, "
@@ -1928,6 +1970,7 @@ class Window(Q.QMainWindow):
         first, i = self._sync_scrub()
         recent = self.spectra[max(first, i - 23):i + 1] if self.spectra else []
         self._recent_shown = (recent[-1][0], x[show], recent[-1][1][show]) if recent else None
+        self._recent_full = (recent[-1][0], np.asarray(recent[-1][1], float), show) if recent else None
         a1.cla(); style_ax(a1)
         a1.set_title("Recent slots, newest brightest" if self._scrub_t is None or not recent else f"Slots up to {recent[-1][0]:%H:%M:%S}, newest brightest")
         cm = RECENT_CMAP
@@ -1983,18 +2026,45 @@ class Window(Q.QMainWindow):
     def _cursor_pixels(self):
         return None if self.axis is None and self.latest is None else self._x()
 
+    def _pixel_at(self, x):
+        """Index of the pixel nearest wavelength x on the axis shown, or None."""
+        xs = self._cursor_pixels()
+        if xs is None or not len(xs) or x is None:
+            return None
+        return int(np.argmin(np.abs(np.asarray(xs, float) - float(x))))
+
+    def _readout(self, i) -> list:
+        """0.4.2: wavelength, pixel and the values at exactly pixel i (not the nearest pixel still drawn, which is a
+        neighbour when a hot pixel is hidden)."""
+        xs = self._cursor_pixels(); parts = [f"<b>{float(xs[i]):.2f} nm</b> (pixel {i})"]
+        if self._live_shown is not None and i < len(self._live_shown[0]):
+            v, show, unit = self._live_shown
+            parts.append(f"live {v[i]:,.1f} {unit}" if show[i] else "live: hidden hot/cold pixel")
+        if self._recent_full is not None and i < len(self._recent_full[1]):
+            t, v, show = self._recent_full
+            parts.append(f"{t:%H:%M:%S} slot {v[i]:,.1f} counts/s" if show[i] else f"{t:%H:%M:%S} slot: hidden pixel")
+        return parts
+
+    def _spec_hover(self, ev):
+        """Pointing at a plot reads the wavelength there, with no click needed."""
+        axes = list(self.c_spec.ax) + [self.ax_strip]
+        i = self._pixel_at(ev.xdata) if ev is not None and ev.inaxes in axes and ev.xdata is not None else None
+        if i != self._hover_i:
+            self._hover_i = i; self._spec_cursor_text()
+
     def _spec_cursor_text(self):
-        c = self.spec_cursor
-        if not c.on or c.x is None:
-            self.spec_cur_info.setText("Click a plot to place the cursor" if c.on else ""); return
-        parts = [f"<b>{c.x:.2f} nm</b>"]
-        xd, yd = np.asarray(self.l_live.get_xdata(), float), np.asarray(self.l_live.get_ydata(), float)
-        if xd.size:
-            parts.append(f"live {yd[int(np.argmin(np.abs(xd - c.x)))]:,.1f} {'counts/s' if self.cb_rate.isChecked() else 'counts'}")
-        if self._recent_shown is not None:
-            t, xs, ys = self._recent_shown
-            parts.append(f"{t:%H:%M:%S} slot {ys[int(np.argmin(np.abs(xs - c.x)))]:,.1f} counts/s")
-        self.spec_cur_info.setText(", ".join(parts))
+        c = self.spec_cursor; out = []
+        if c.on and c.x is not None:
+            i = self._pixel_at(c.x)
+            if i is not None:
+                out.append("Cursor " + ", ".join(self._readout(i)))
+        elif c.on:
+            out.append(c.hint or "Click a plot to place the cursor")
+        if c.on and c.x is not None and c.hint:
+            out.append(c.hint)
+        if self._hover_i is not None and self._cursor_pixels() is not None and self._hover_i < len(self._cursor_pixels()):
+            out.append("Pointer " + ", ".join(self._readout(self._hover_i)))
+        self.spec_cur_info.setText("  ·  ".join(out))
 
     def _wf_cursor_text(self):
         c = self.wf_cursor
@@ -2054,14 +2124,14 @@ class Window(Q.QMainWindow):
         if do_x:
             zoom(ax.get_xlim, ax.set_xlim, ev.xdata, False)
         if canvas is self.c_spec:
-            self._manual_view()
+            self._manual_view(); self._full_hold = False
         canvas.draw_idle()
 
     def _on_click(self, ev):
         if ev.dblclick and ev.inaxes in self.c_cal.ax:
             self._draw_cal(); return
         if ev.dblclick and ev.inaxes in self.c_spec.ax:
-            self._a1_ylim = None
+            self._a1_ylim = None; self._full_hold = False
             if self.cb_auto.isChecked():
                 self._draw_live(force=True)
             else:
@@ -2070,14 +2140,38 @@ class Window(Q.QMainWindow):
     def _on_release(self, ev):
         """A pan/zoom made with the toolbar is kept (Auto-scale unticks itself)."""
         if getattr(self.spec_tb, "mode", "") and ev.inaxes in self.c_spec.ax:
-            self._manual_view()
+            self._manual_view(); self._full_hold = False
             self._a1_ylim = self.c_spec.ax[1].get_ylim()
 
     def _cal_fit_y(self):
         a0, a1 = self.c_cal.ax; xl = a0.get_xlim()
         self._fit_y(a0, xl); self._fit_y(a1, xl); self.c_cal.draw_idle()
 
+    def _full_scale(self):
+        """0.4.2: the whole spectrum against the detector's full range, held while the live view updates."""
+        if self.latest is None and self.axis is None:
+            return
+        x = self._x(); a0 = self.c_spec.ax[0]
+        a0.set_xlim(float(x[0]), float(x[-1]))
+        self._manual_view(); self._full_hold = True
+        self._apply_full_scale(); self.spec_cursor.sync(); self.c_spec.draw_idle()
+
+    def _apply_full_scale(self):
+        """y from 0 (or the lowest value, if below 0) to 3 % above the largest count the detector can give, in the units shown."""
+        a0 = self.c_spec.ax[0]
+        top = float((self.info or {}).get("native_max_counts") or 65535.0)
+        k = 1e6 / (self.latest_int or 1) if self.cb_rate.isChecked() else 1.0
+        yd = np.asarray(self.l_live.get_ydata(), float); yd = yd[np.isfinite(yd)]
+        if a0.get_yscale() == "log":
+            pos = yd[yd > 0]
+            a0.set_ylim(max(float(pos.min()) / 1.3, 1e-3) if pos.size else 1.0, top * k * 1.15)
+        else:
+            lo = min(0.0, float(yd.min())) if yd.size else 0.0
+            hi = top * k * 1.03
+            a0.set_ylim(lo - 0.02 * (hi - lo), hi)
+
     def _fit_y_now(self):
+        self._full_hold = False
         a0, a1 = self.c_spec.ax; xl = a0.get_xlim()
         self._fit_y(a0, xl); self._fit_y(a1, xl); self._a1_ylim = a1.get_ylim()
         self.c_spec.draw_idle()

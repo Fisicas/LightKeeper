@@ -126,7 +126,8 @@ w._auto = True; w._auto_failed = None; w.state = "DISCONNECTED"; w.link = None; 
 w.settings.setValue("last_serial", "USB2G52537")
 w._auto_connect()
 check("the spectrometer used last opens, with no dialog", sent and sent[-1][:2] == ("connect", "sb:USB2G52537") and not dialogs, sent)
-w.settings.setValue("last_serial", "NOT_ATTACHED"); sent.clear(); w._auto_live = False; w._auto_connect()
+check("no second connect while the first is on its way (0.4.2)", (sent.clear(), w._auto_connect(), not sent)[2])
+w.settings.setValue("last_serial", "NOT_ATTACHED"); sent.clear(); w._auto_live = False; w._pending_connect = 0.0; w._auto_connect()
 check("last one not attached: the first named one opens", sent and sent[-1][:2] == ("connect", "od:MAYP111000"), sent)
 check("an entry that could not be named is never opened automatically", all(a[1] != 12 for a in sent))
 # switching from the list while connected, and the live view coming back
@@ -142,7 +143,7 @@ w._set_state("RECORDING"); sent.clear(); w._device_picked(0)
 check("no switching during a run", not sent)
 w._set_state("DISCONNECTED")
 # nothing opens (and nothing is asked) before the splash has closed
-w2_started = w._started; w._started = False; sent.clear(); w._auto_failed = None; w._auto_live = False; w._auto_connect()
+w2_started = w._started; w._started = False; sent.clear(); w._auto_failed = None; w._auto_live = False; w._pending_connect = 0.0; w._auto_connect()
 check("nothing opens before start-up has finished", not sent)
 w._started = w2_started
 Q.QInputDialog.getItem = orig
