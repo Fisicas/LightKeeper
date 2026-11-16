@@ -56,8 +56,14 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
 
 ## Supported spectrometers
 
-LightKeeper opens any spectrometer that Ocean Insight's **OceanDirect SDK** can open over USB. It has been run on a
-**Maya2000 Pro**. Other OceanDirect models should work, but are untested; please open an issue with what you try.
+LightKeeper finds Ocean spectrometers on USB through two backends. It tries Ocean Insight's **OceanDirect SDK** first. Then
+**seabreeze** adds the legacy models OceanDirect does not open, such as the **USB650**. It has been run on a **Maya2000 Pro**
+(OceanDirect) and a **USB650** (seabreeze). Other models should work, but are untested; please open an issue with what you try.
+If more than one is attached, the window asks which to open.
+
+- **seabreeze:** if it is not installed, the window installs it once into `%LOCALAPPDATA%\LightKeeper\deps`, leaving the Python
+  environment unchanged. This needs internet access the first time. Saturation and exposure thresholds scale to each
+  detector's range: 60,000 counts on 16-bit, 3,749 on the 12-bit USB650.
 
 - **OceanView:** this is Ocean Insight's own acquisition software, and LightKeeper does not need it. Close OceanView
   before starting LightKeeper, because only one program can hold a USB spectrometer.
@@ -70,7 +76,8 @@ You need:
 - Windows 10 or 11;
 - Python 3.12 with PySide6, NumPy, SciPy, Matplotlib and h5py;
 - the [OceanDirect SDK](https://www.oceaninsight.com/) installed at its default location, or wherever
-  `OCEANDIRECT_HOME` points.
+  `OCEANDIRECT_HOME` points (for OceanDirect models such as the Maya2000 Pro; a USB650 needs only the Windows USB driver
+  OceanView installs, plus seabreeze, which LightKeeper installs itself).
 
 1. **Launch.** Double-click `Launch_LightKeeper.cmd`. It uses `LIGHTKEEPER_PYTHON`, or else the first `pythonw.exe` on PATH.
    For a Start menu or desktop shortcut, `LightKeeper.ico` in the same folder is the app's icon.

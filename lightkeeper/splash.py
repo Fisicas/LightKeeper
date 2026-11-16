@@ -170,6 +170,12 @@ def _load_libraries(splash: SplashScreen | None):
             import lightkeeper.ui  # noqa: F401
         except BaseException as e:
             box["error"] = e
+            return
+        try:                    # 0.4.0: seabreeze for spectrometers OceanDirect cannot open (USB650): installed once, if missing
+            from lightkeeper.devices import ensure_seabreeze
+            ensure_seabreeze(install=True)
+        except Exception:
+            pass
     t = threading.Thread(target=job, daemon=True, name="LightKeeperImport"); t.start()
     while t.is_alive():
         Q.QApplication.processEvents()

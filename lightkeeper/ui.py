@@ -302,7 +302,9 @@ class Window(Q.QMainWindow):
         # like OceanView: open the first attached spectrometer and show single 100 ms scans, without pressing Connect.
         # Off after the user disconnects; a device that failed to open is not retried until the attached set changes.
         self._auto = os.environ.get("LIGHTKEEPER_AUTOCONNECT", "1") != "0"; self._auto_live = False; self._auto_failed = None; self._last_auto_try = 0.0
+        self._auto_choice = 0 if auto_confirm else None
         self._build()
+        self.setAcceptDrops(True); Q.QApplication.instance().installEventFilter(self)
         self.exp_mode.setCurrentIndex(1); self.int_spin.setValue(LIVE_START_MS)
         progress(2)
         self._apply_previous_setup()
@@ -552,6 +554,13 @@ class Window(Q.QMainWindow):
         f = form(lay)
         self.setup_src = Q.QLabel(""); self.setup_src.setObjectName("secondary"); self.setup_src.setWordWrap(True); self.setup_src.setVisible(False)
         f.addRow(self.setup_src)
+        self.btn_setup = Q.QToolButton(); self.btn_setup.setText("Load setup from a run…")
+        self.btn_setup.setPopupMode(Q.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_setup.setToolTip("Copy the settings of an earlier run into this panel. You can also drop a run folder or its "
+                                  "run_metadata.json anywhere on the window.")
+        self.setup_menu = Q.QMenu(self.btn_setup); self.setup_menu.aboutToShow.connect(self._fill_setup_menu)
+        self.btn_setup.setMenu(self.setup_menu)
+        f.addRow(self.btn_setup)
         self.label_edit = Q.QLineEdit(""); self.label_edit.setPlaceholderText("e.g. rooftop_south_diffuser"); f.addRow("Label", self.label_edit)
         self.geom_edit = Q.QLineEdit(""); self.geom_edit.setPlaceholderText("e.g. 50 um fiber + diffuser, facing south"); f.addRow("Geometry", self.geom_edit)
         self.geom_edit.setCursorPosition(0)
@@ -614,9 +623,10 @@ class Window(Q.QMainWindow):
         self.run_exp.currentIndexChanged.connect(lambda i: self.auto_range_row.setEnabled(i == 1))
         self.auto_range_row.setEnabled(False)
         self.backoff_step = dspin(0, 1000, 10, 0, 5, "ms"); self.backoff_min = dspin(1, 60000, 10, 0, 5, "ms")
-        self.backoff_step.setToolTip("Fixed exposure: after a slot that reaches 55,000 counts, step the integration time down by "
+        self.backoff_step.setToolTip("Fixed exposure: after a slot that reaches the step-down level (55,000 counts on a 16-bit "
+                                     "detector such as the Maya2000 Pro, 3,437 on a 12-bit USB650), step the integration time down by "
                                      "this much (down to the floor), and back up towards the fixed time after 30 s that would stay "
-                                     "under 40,000 counts. Every step gets a dark set. 0 = off.")
+                                     "under two thirds of full scale. Every step gets a dark set. 0 = off.")
         self.backoff_row = hbox(self.backoff_step, "steps down to", self.backoff_min, stretch_first=False)
         f.addRow("Back off", self.backoff_row)
         self.run_exp.currentIndexChanged.connect(lambda i: self.backoff_row.setEnabled(i == 0))
@@ -711,6 +721,10 @@ class Window(Q.QMainWindow):
         frame.setFixedWidth(min(SETUP_MAX_W, max(SETUP_MIN_W, need)))
         return frame
 
+    def _sat(self) -> float:
+        """Saturation level of the connected spectrometer (12-bit USB650: 3,749; 16-bit: 60,000)."""
+        return float((self.info or {}).get("saturation_level_counts") or SAT_LEVEL)
+
     def _apply_previous_setup(self):
         """Fill the setup panel from the newest run in the Save in folder, so setting up a run takes one press of Start.
         Dates and times are worked out afresh; a label ending in 'day N' counts up. Every field can still be edited."""
@@ -718,7 +732,112 @@ class Window(Q.QMainWindow):
         p = (last or {}).get("plan")
         if not p or last.get("_folder") == self._setup_from:
             return
-        self._setup_from = last.get("_folder")
+        self._apply_setup(last, last.get("_folder"), "Setup copied from the previous run")
+
+    # 0.4.0: a setup from any earlier run: the Load setup menu, or a run_metadata.json / run folder dropped on the window
+    @staticmethod
+    def _read_setup(path) -> tuple[dict | None, str]:
+        """(metadata with a 'plan', name) from a run folder, run_metadata.json, run_state.json or a bare plan .json."""
+        path = Path(path)
+        if path.is_dir():
+            path = path / "run_metadata.json"
+        m = read_json(path) if path.suffix.lower() == ".json" and path.is_file() else None
+        if not isinstance(m, dict):
+            return None, ""
+        name = path.parent.name if path.name in ("run_metadata.json", "run_state.json") else path.name
+        if isinstance(m.get("plan"), dict):
+            return m, name
+        if "slot_s" in m and "label" in m:            # a plan file (pending/plan_*.json, or saved by hand)
+            return dict(plan=m, app=""), name
+        return None, name
+
+    def _import_setup(self, path) -> bool:
+        """Ask, then replace the setup panel with an earlier run's settings. False if nothing was applied."""
+        if self.state in RUN_STATES or self.link is not None:
+            Q.QMessageBox.information(self, APP_NAME, "A run is open, so its setup cannot be replaced now.\n\n"
+                                      "Load the setup again after the run has finished."); return False
+        meta, name = self._read_setup(path)
+        if meta is None:
+            Q.QMessageBox.warning(self, APP_NAME, f"No run settings found in\n{path}\n\nDrop a run folder, its run_metadata.json, "
+                                  "or a plan .json."); return False
+        p = meta["plan"]
+        when = str(meta.get("planned_start_local") or p.get("resolved_start_local") or "")[:16].replace("T", " ")
+        exp = "automatic exposure" if p.get("auto_exposure") else f"fixed {float(p.get('int_ms', 0)):g} ms"
+        dev = meta.get("device") or {}
+        lines = [f"Run: {name}", f"Label: {p.get('label', '')}", f"Recorded: {when or 'unknown'}",
+                 f"Spectrometer: {dev.get('model', '?')} {dev.get('serial', '')}".rstrip(), f"Exposure: {exp}",
+                 f"Geometry: {p.get('geometry') or '-'}", f"Site: {p.get('site_lat')}, {p.get('site_lon')}"]
+        if not self._ask("Load setup", "Replace the current setup with this run's settings?\n\n" + "\n".join(lines) +
+                         "\n\nStart and stop keep their rule (fixed time or sun event); the dates are worked out afresh. "
+                         "Everything can still be edited before Start.", "Replace setup", "Keep current"):
+            return False
+        self._apply_setup(meta, str(path), f"Setup copied from {name}")
+        self._remember_setup_source(str(path))
+        return True
+
+    def _remember_setup_source(self, path: str):
+        rec = [x for x in (self.settings.value("setup_recent", []) or []) if x and x != path]
+        if isinstance(rec, str):
+            rec = [rec]
+        self.settings.setValue("setup_recent", [path] + list(rec)[:9])
+
+    def _fill_setup_menu(self):
+        """Recent runs in the Save in folder, setups loaded before, and Browse."""
+        m = self.setup_menu; m.clear()
+        metas = self._run_metas()[::-1][:12]
+        if metas:
+            m.addSection("Runs in the Save in folder")
+        for meta in metas:
+            p = meta.get("plan", {})
+            exp = "auto" if p.get("auto_exposure") else f"{float(p.get('int_ms', 0)):g} ms"
+            dev = (meta.get("device") or {}).get("model", "")
+            a = m.addAction(f"{meta['_folder']}   ({dev} {exp})".replace("  ( ", "  ("))
+            a.triggered.connect(lambda _=False, d=meta["_dir"]: self._import_setup(d))
+        rec = self.settings.value("setup_recent", []) or []
+        rec = [rec] if isinstance(rec, str) else [x for x in rec if x and Path(x).exists()]
+        here = {str(meta["_dir"]) for meta in metas}
+        rec = [x for x in rec if x not in here and str(Path(x).parent) not in here]
+        if rec:
+            m.addSection("Loaded before")
+            for x in rec[:8]:
+                a = m.addAction(Path(x).parent.name if Path(x).name == "run_metadata.json" else Path(x).name)
+                a.setToolTip(x); a.triggered.connect(lambda _=False, x=x: self._import_setup(x))
+        m.addSeparator()
+        m.addAction("Browse for run_metadata.json…", self._browse_setup)
+
+    def _browse_setup(self):
+        fn, _ = Q.QFileDialog.getOpenFileName(self, "Load setup from a run", self.out_edit.text(),
+                                              "Run settings (run_metadata.json *.json)")
+        if fn:
+            self._import_setup(fn)
+
+    @staticmethod
+    def _dropped_setup(ev):
+        """The first local run folder or .json in a drag, or None."""
+        md = ev.mimeData()
+        if not md or not md.hasUrls():
+            return None
+        for u in md.urls():
+            f = Path(u.toLocalFile()) if u.isLocalFile() else None
+            if f and (f.suffix.lower() == ".json" or (f.is_dir() and (f / "run_metadata.json").exists())):
+                return f
+        return None
+
+    def eventFilter(self, obj, ev):
+        """Drops of a run's settings anywhere on the window, line edits and plots included."""
+        et = ev.type()
+        if et in (QtCore.QEvent.Type.DragEnter, QtCore.QEvent.Type.DragMove, QtCore.QEvent.Type.Drop) and \
+                isinstance(obj, Q.QWidget) and obj.window() is self and self._dropped_setup(ev) is not None:
+            ev.setDropAction(QtCore.Qt.DropAction.CopyAction); ev.accept()
+            if et == QtCore.QEvent.Type.Drop:
+                f = self._dropped_setup(ev)
+                QtCore.QTimer.singleShot(0, lambda: (self.raise_(), self.activateWindow(), self._import_setup(f)))
+            return True
+        return super().eventFilter(obj, ev)
+
+    def _apply_setup(self, last: dict, source: str, headline: str):
+        p = last["plan"]
+        self._setup_from = source
         self._applying_setup = True
         try:
             def put(key, fn):
@@ -768,9 +887,9 @@ class Window(Q.QMainWindow):
         self.label_edit.setCursorPosition(0); self.geom_edit.setCursorPosition(0)
         self.auto_range_row.setEnabled(self.run_exp.currentIndex() == 1); self.backoff_row.setEnabled(self.run_exp.currentIndex() == 0)
         self._schedule_rows(); self._show_site()
-        self.setup_src.setText("Setup copied from the previous run"); self.setup_src.setToolTip(f"{self._setup_from}\nDates and times are new. Edit anything before pressing Start.")
+        self.setup_src.setText(headline); self.setup_src.setToolTip(f"{self._setup_from}\nDates and times are new. Edit anything before pressing Start.")
         self.setup_src.setVisible(True)
-        self._log(f"setup copied from the previous run, {self._setup_from}")
+        self._log(f"{headline.lower()}, {self._setup_from}")
         self._update_schedule()
 
     def _schedule_rows(self, *_):
@@ -885,13 +1004,46 @@ class Window(Q.QMainWindow):
         self.c_wf.ax[0].set_title("Recorded spectra over time")
         self.tabs.addTab(w, "Waterfall")
 
+    TS_SERIES = (("par", "420–700 nm rate", 1.4), ("rfr", "R:FR", 1.0), ("nirred", "NIR/red", 1.0),
+                 ("o2a", "O₂-A depth", 1.0), ("int", "Integration and scans", 1.0))
+
     def _tab_timeseries(self):
         w = Q.QWidget(); v = Q.QVBoxLayout(w); v.setContentsMargins(0, 6, 0, 0)
-        self.c_ts = Canvas(5, 1, [1.4, 1, 1, 1, 1], sharex=True); v.addWidget(plot_toolbar(self.c_ts, self)); v.addWidget(self.c_ts, 1)
-        for a, t in zip(self.c_ts.ax, ["420–700 nm rate (counts/s, instrument-relative)", "R:FR counts (655–665 / 725–735)",
-                                       "NIR/red (780–820 / 665–680)", "O₂-A apparent depth (760 nm)", "Integration time and scans per slot"]):
-            a.set_title(t)
+        self.c_ts = Canvas(1, 1)
+        r = Q.QHBoxLayout(); r.addWidget(plot_toolbar(self.c_ts, self)); r.addSpacing(12); r.addWidget(Q.QLabel("Show:"))
+        saved = self.settings.value("ts_shown", None)
+        saved = [saved] if isinstance(saved, str) else (list(saved) if saved else [k for k, _, _ in self.TS_SERIES])
+        self.ts_cbs = {}
+        for k, lab, _ in self.TS_SERIES:
+            cb = Q.QCheckBox(lab); cb.setChecked(k in saved); cb.toggled.connect(self._ts_layout); self.ts_cbs[k] = cb; r.addWidget(cb)
+        r.addStretch(1); v.addLayout(r); v.addWidget(self.c_ts, 1)
+        self._ts_twin = None
+        self._ts_layout()
         self.tabs.addTab(w, "Time series")
+
+    def _ts_layout(self, *_):
+        """0.4.0: one panel per chosen series; the chosen ones share the height. At least one stays on."""
+        keys = [k for k, _, _ in self.TS_SERIES if self.ts_cbs[k].isChecked()]
+        if not keys:
+            cb = self.sender() if isinstance(self.sender(), Q.QCheckBox) else self.ts_cbs["par"]
+            cb.blockSignals(True); cb.setChecked(True); cb.blockSignals(False)
+            keys = [k for k, _, _ in self.TS_SERIES if self.ts_cbs[k].isChecked()]
+        self.settings.setValue("ts_shown", keys)
+        fig = self.c_ts.fig; fig.clear(); self._ts_twin = None
+        ratios = [r for k, _, r in self.TS_SERIES if k in keys]
+        gs = fig.add_gridspec(len(keys), 1, height_ratios=ratios)
+        axs = []
+        for i in range(len(keys)):
+            a = fig.add_subplot(gs[i, 0], sharex=axs[0] if axs else None); style_ax(a); axs.append(a)
+        self.c_ts.ax = axs; self.ts_ax = dict(zip(keys, axs))
+        titles = dict(par="420–700 nm rate (counts/s, instrument-relative)", rfr="R:FR counts (655–665 / 725–735)",
+                      nirred="NIR/red (780–820 / 665–680)", o2a="O₂-A apparent depth (760 nm)", int="Integration time and scans per slot")
+        for k, a in self.ts_ax.items():
+            a.set_title(titles[k], loc="left", fontsize=9)
+        if self.slots:
+            self._draw_timeseries()
+        else:
+            self.c_ts.draw_idle()
 
     def _tab_schedule(self):
         w = Q.QWidget(); h = Q.QHBoxLayout(w); h.setContentsMargins(0, 6, 0, 0)
@@ -995,7 +1147,7 @@ class Window(Q.QMainWindow):
         for i, lab in devs:
             self.dev_combo.addItem(lab, i)
         if err:
-            self._log(f"OceanDirect: {err}")
+            self._log(f"device search: {err}")
 
     def _connect(self):
         if self.state == "DISCONNECTED":
@@ -1080,21 +1232,26 @@ class Window(Q.QMainWindow):
 
     def _last_runs(self, label):
         """(newest run's metadata, newest run's metadata with the same label) in the Save in folder, or None."""
+        metas = self._run_metas()
+        same = [m for m in metas if m.get("plan", {}).get("label") == label]
+        return (metas[-1] if metas else None), (same[-1] if same else None)
+
+    def _run_metas(self) -> list:
+        """Metadata of the runs in the Save in folder, oldest first ('_folder' and '_dir' added)."""
         metas = []
         for root in (self.out_edit.text(), str(self.settings.value("setup_fallback_dir", "") or "")):   # after moving to an empty folder
             try:
                 for d in Path(root).iterdir() if root else ():
                     m = read_json(d / "run_metadata.json") if d.is_dir() else None
                     if m and m.get("planned_start_local"):
-                        m["_folder"] = d.name
+                        m["_folder"] = d.name; m["_dir"] = str(d)
                         metas.append(m)
             except Exception:
                 pass
             if metas:
                 break
         metas.sort(key=lambda m: m["planned_start_local"])
-        same = [m for m in metas if m.get("plan", {}).get("label") == label]
-        return (metas[-1] if metas else None), (same[-1] if same else None)
+        return metas
 
     def _preflight(self, plan, e) -> list:
         """[(level, text)], level ok / warn / bad: what to check before an unattended run."""
@@ -1373,6 +1530,11 @@ class Window(Q.QMainWindow):
                                       f"{i.get('wl_first', self.wl_dev[0]):.1f}–{i.get('wl_last', self.wl_dev[-1]):.1f} nm. "
                                       f"Shortest integration {i.get('min_int_us_used', 0) / 1000:g} ms (SDK reports {i.get('sdk_min_int_us', 0) / 1000:g} ms). "
                                       f"Electric dark {onoff(i.get('electric_dark_correction'))}, nonlinearity {onoff(i.get('nonlinearity_correction'))}.")
+                self.l_sat.set_label(f"Saturation, {self._sat():,.0f}")
+                if i.get("serial") and not str(i.get("serial")).upper().startswith("SIM"):
+                    self.settings.setValue("last_serial", str(i.get("serial")))
+                if self.c_spec.ax[0].get_legend() is not None:
+                    self.c_spec.ax[0].legend(loc="upper right")
                 self._log(f"connected: {json.dumps(i, default=str)}"); self._update_schedule()
             elif t == "log":
                 self._log(e["text"])
@@ -1513,9 +1675,29 @@ class Window(Q.QMainWindow):
         real = [i for i in ids if i is not None and i != SIM_ID]
         if not real or tuple(real) == self._auto_failed:
             return
-        self.dev_combo.setCurrentIndex(ids.index(real[0])); self._auto_live = tuple(real)
+        pick = real[0]
+        if len(real) > 1:                      # 0.4.0: more than one spectrometer attached: ask which one
+            pick = self._choose_device(real)
+            if pick is None:
+                self._auto_failed = tuple(real)    # not asked again until the attached set changes; Connect still works
+                self._log("several spectrometers attached; none chosen. Pick one in the list and press Connect.")
+                return
+        self.dev_combo.setCurrentIndex(ids.index(pick)); self._auto_live = tuple(real)
         self._log(f"opening {self.dev_combo.currentText().strip()} automatically; live view at {LIVE_START_MS} ms")
-        self.engine.send("connect", real[0], self.cb_edc.isChecked(), self.cb_nlc.isChecked())
+        self.engine.send("connect", pick, self.cb_edc.isChecked(), self.cb_nlc.isChecked())
+
+    def _choose_device(self, real):
+        """Ask which of several attached spectrometers to open; the one used last is offered first. None = cancelled."""
+        labels = [self.dev_combo.itemText(self.dev_combo.findData(i)) for i in real]
+        last = str(self.settings.value("last_serial", "") or "")
+        first = next((k for k, lab in enumerate(labels) if last and f"[{last}]" in lab), 0)
+        if self._auto_choice is not None:      # tests and --auto-confirm
+            return real[min(self._auto_choice, len(real) - 1)]
+        item, ok = Q.QInputDialog.getItem(self, "Choose a spectrometer",
+                                          f"{len(real)} spectrometers are attached. Which one should LightKeeper open?\n"
+                                          "(Only one program can hold a spectrometer; the other stays free.)",
+                                          labels, first, False)
+        return real[labels.index(item)] if ok and item in labels else None
 
     def _resume_dialog(self):
         runs = [r for r in open_runs() if not supervisor_alive(r["run_dir"])]
@@ -1682,7 +1864,7 @@ class Window(Q.QMainWindow):
             self.l_dark.set_data(x[show], d[show] * k)
         else:
             self.l_dark.set_data([], [])
-        self.l_sat.set_ydata([SAT_LEVEL * k] * 2); self.l_sat.set_visible(not self.cb_dark.isChecked())
+        self.l_sat.set_ydata([self._sat() * k] * 2); self.l_sat.set_visible(not self.cb_dark.isChecked())
         a0.set_yscale("log" if self.cb_log.isChecked() else "linear"); a0.set_ylabel("Counts/s" if k != 1 else "Counts")
         if not self.cb_log.isChecked():
             a0.yaxis.set_major_formatter(THOUSANDS)
@@ -1879,20 +2061,35 @@ class Window(Q.QMainWindow):
         t = [s["t"] for s in S]
         for a in self.c_ts.ax:
             a.cla(); style_ax(a)
-        a = self.c_ts.ax
-        a[0].plot(t, [s["par"] for s in S], color=GOLD, lw=0.8); a[0].set_yscale("log"); a[0].set_title(f"420–700 nm rate (counts/s, instrument-relative) · {rtxt}", loc="left", fontsize=9)
-        a[1].plot(t, [s["rfr"] for s in S], color=RED, lw=0.8); a[1].set_title("R:FR counts (655–665 / 725–735)", loc="left", fontsize=9)
-        a[2].plot(t, [s["nirred"] for s in S], color=TEAL, lw=0.8); a[2].set_title("NIR/red (780–820 / 665–680)", loc="left", fontsize=9)
-        a[3].plot(t, [s["o2a"] for s in S], color=BLUE, lw=0.8); a[3].set_title("O₂-A apparent depth (760 nm; shoulders 754–756 / 770–772)", loc="left", fontsize=9)
-        a[4].step(t, [s["int_ms"] for s in S], color=GOLD, lw=0.8, where="mid"); a[4].set_yscale("log"); a[4].set_ylabel("ms")
+        A = self.ts_ax; first = next(iter(A))
+        tag = lambda k, txt: txt + (f" · {rtxt}" if k == first else "")   # noqa: E731
+        if "par" in A:
+            a = A["par"]; a.plot(t, [s["par"] for s in S], color=GOLD, lw=0.8); a.set_yscale("log")
+            a.set_title(tag("par", "420–700 nm rate (counts/s, instrument-relative)"), loc="left", fontsize=9)
+        if "rfr" in A:
+            A["rfr"].plot(t, [s["rfr"] for s in S], color=RED, lw=0.8); A["rfr"].set_title(tag("rfr", "R:FR counts (655–665 / 725–735)"), loc="left", fontsize=9)
+        if "nirred" in A:
+            A["nirred"].plot(t, [s["nirred"] for s in S], color=TEAL, lw=0.8); A["nirred"].set_title(tag("nirred", "NIR/red (780–820 / 665–680)"), loc="left", fontsize=9)
+        if "o2a" in A:
+            A["o2a"].plot(t, [s["o2a"] for s in S], color=BLUE, lw=0.8)
+            A["o2a"].set_title(tag("o2a", "O₂-A apparent depth (760 nm; shoulders 754–756 / 770–772)"), loc="left", fontsize=9)
         if getattr(self, "_ts_twin", None) is not None:
-            self._ts_twin.remove()
-        b = self._ts_twin = a[4].twinx(); b.plot(t, [s["n"] for s in S], ".", ms=1.5, color=MUTED); b.tick_params(colors=MUTED, labelsize=8)
-        sat = [s["t"] for s in S if s["nsat"] > 0]
-        if sat:
-            a[4].plot(sat, [S[0]["int_ms"]] * len(sat), "x", color=RED, ms=4)
-        a[4].set_title("integration (ms, gold) · scans per slot (grey) · saturated slots (red ×)", loc="left", fontsize=9)
-        a[4].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=LOCAL_TZ))
+            try:
+                self._ts_twin.remove()
+            except Exception:
+                pass
+            self._ts_twin = None
+        if "int" in A:
+            a = A["int"]
+            a.step(t, [s["int_ms"] for s in S], color=GOLD, lw=0.8, where="mid"); a.set_yscale("log"); a.set_ylabel("ms")
+            b = self._ts_twin = a.twinx(); b.plot(t, [s["n"] for s in S], ".", ms=1.5, color=MUTED); b.tick_params(colors=MUTED, labelsize=8)
+            sat = [s["t"] for s in S if s["nsat"] > 0]
+            if sat:
+                a.plot(sat, [S[0]["int_ms"]] * len(sat), "x", color=RED, ms=4)
+            a.set_title(tag("int", "integration (ms, gold) · scans per slot (grey) · saturated slots (red ×)"), loc="left", fontsize=9)
+        for a in self.c_ts.ax[:-1]:
+            a.tick_params(labelbottom=False)
+        self.c_ts.ax[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=LOCAL_TZ))
         self.c_ts.draw_idle()
 
     def _draw_waterfall(self):
@@ -2030,7 +2227,7 @@ class Window(Q.QMainWindow):
                          "The longest also finds the hot and cold pixels, which are removed before the fit.", "Acquire", "Cancel"):
                 self.engine.send("live_dark", max(times), None, 5, times, self.dark_s.value(), "calibration")
             return
-        msg = f"Turn the {self.lamp_combo.currentText()} lamp ON and aim it at the input. Avoid saturation (peak < 55,000 counts)."
+        msg = f"Turn the {self.lamp_combo.currentText()} lamp ON and aim it at the input. Avoid saturation (peak < {0.92 * self._sat():,.0f} counts)."
         if self._ask("Calibration", msg, "Acquire", "Cancel"):
             self.engine.send("lamp", kind, self.cal_int.value(), self.cal_n.value(), self.lamp_combo.currentText())
 
@@ -2047,7 +2244,7 @@ class Window(Q.QMainWindow):
             y = hotpix.fill(y, self.valid)          # hot and cold pixels from the dark set must not look like lines
             self._log(f"calibration: {int((~self.valid).sum())} hot/cold pixels bridged before peak finding")
         r = fit_calibration(self.wl_dev, y, self.lamp_combo.currentText(), deg=self.cal_deg.value(), min_rel=self.cal_minrel.value(),
-                            isolation_nm=self.cal_iso.value(), snr=self.cal_snr.value(), raw_max=lamp["raw_max"])
+                            isolation_nm=self.cal_iso.value(), snr=self.cal_snr.value(), raw_max=lamp["raw_max"], sat=self._sat())
         self.cal_result = r; self._cal_y = y; self._cal_dark = dmean
         if not r["ok"]:
             self.cal_text.setPlainText("FIT FAILED\n" + r["message"]); self._draw_cal(); return
@@ -2084,7 +2281,7 @@ class Window(Q.QMainWindow):
                 if self.valid is not None:
                     y = hotpix.fill(y, self.valid)
             a0.plot(x, y, color=TEAL, lw=0.7)
-            a0.axhline(SAT_LEVEL, color=RED, ls="--", lw=0.6, gid="sat")
+            a0.axhline(self._sat(), color=RED, ls="--", lw=0.6, gid="sat")
             refs = reference_lines(self.lamp_combo.currentText(), float(x[5]), float(x[-5]), self.cal_minrel.value(), self.cal_iso.value())
             top = float(np.nanmax(y)) if np.isfinite(y).any() else 1
             for r in refs:

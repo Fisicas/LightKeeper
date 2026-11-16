@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.0 (2026-11-15)
+- **Finds any Ocean spectrometer, Maya2000 Pro and USB650 included.** OceanDirect is searched first, then seabreeze (pyseabreeze over
+  the existing WinUSB driver) adds the legacy models OceanDirect 3.1 does not open, such as the USB650. The separate
+  `0.3.15+usb650` copy is no longer needed.
+  - **seabreeze is installed once, by itself.** If it is missing, the window installs the pinned packages (seabreeze 2.11.0,
+    PyUSB 1.3.1, libusb-package 1.0.30.1, importlib-resources 7.1.0) into `%LOCALAPPDATA%\LightKeeper\deps` while the splash
+    shows, with `--no-deps`. The Python environment itself is not changed. Without it, OceanDirect devices still work.
+  - **USB650:** native 12-bit counts, read with a packet-aligned buffer and a checked frame (as in the 0.3.15+usb650 copy).
+    Integration is 3 ms to 60 s, in whole milliseconds. Electric dark and nonlinearity corrections are reported as not supported.
+  - **Thresholds follow the detector.** Saturation, back-off, auto-exposure and calibration levels now come from each device's
+    largest count. 16-bit detectors keep 60,000 / 55,000 / 40,000 / 15,000. A 12-bit USB650 uses 3,749 / 3,437 / 2,499 / 937,
+    the same as the compatibility copy. The live view's saturation line and the metadata (`native_max_counts`,
+    `saturation_level_counts`) say which applies.
+  - **Several attached: you choose.** The window asks which one to open, offering the one used last first. Cancel leaves both
+    free until the set of attached spectrometers changes, and Connect still works.
+  - Devices are listed by model and serial (`Maya2000 Pro [MAYP111000] (OceanDirect)`). OceanDirect devices are opened by serial,
+    because OceanDirect's numeric ids change at every USB rescan.
+- **Load setup from a run.** A new menu in the Run section lists the runs in the Save in folder and setups loaded before, plus
+  Browse. You can also drop a run folder or its `run_metadata.json` anywhere on the window, plots and text boxes included. Either
+  way, LightKeeper asks before it replaces the setup. Dates are worked out afresh, as for the previous-run setup. A setup cannot
+  be replaced while a run is open.
+- **Choose the time series.** Tick boxes above the Time series tab show any of the five panels. The panels you keep share the
+  height, and the choice is remembered.
+- **Smaller files.** The per-slot standard deviation is stored with its mantissa rounded to 10 bits (relative error at most
+  0.05 %, far below the uncertainty of an SD from 20-100 scans). It is still float32, so readers need no change. On the
+  15 Nov 2026 runs this halves `blocks/sd`, saving about 23 % of a USB650 day and 9 % of a Maya day. Means and frames are
+  unchanged. `run_metadata.json` notes it as `sd_storage`.
+- **Hardware check:** `tests/hw_all_spectrometers.py` connects every attached spectrometer, takes live scans and reopens each by
+  serial. It passed with a Maya2000 Pro and a USB650 on one computer.
+
 ## 0.3.15 (2026-11-05)
 - **Fixed:** pressing Tab in the setup panel could shift its content sideways and cut off the labels, with no way back short of
   restarting. The panel now fits its content, and sideways scrolling is locked. Tab still scrolls it up and down.

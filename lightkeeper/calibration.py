@@ -89,12 +89,12 @@ def find_peaks_px(y: np.ndarray, snr: float = 15.0):
 
 
 def fit_calibration(device_wl: np.ndarray, lamp_counts: np.ndarray, lamp: str, deg: int = 3, min_rel: float = 0.02,
-                    isolation_nm: float = 1.0, snr: float = 15.0, raw_max: np.ndarray | None = None) -> dict:
+                    isolation_nm: float = 1.0, snr: float = 15.0, raw_max: np.ndarray | None = None, sat: float = SAT) -> dict:
     """lamp_counts: dark-subtracted mean. raw_max: per-pixel max of the raw scans (for saturation rejection)."""
     px = np.arange(len(device_wl), dtype=float)
     pk, height, noise = find_peaks_px(lamp_counts, snr)
     if raw_max is not None:
-        sat = raw_max[np.round(pk).astype(int)] >= SAT
+        sat = raw_max[np.round(pk).astype(int)] >= sat
     else:
         sat = np.zeros(len(pk), bool)
     n_sat = int(sat.sum()); pk, height = pk[~sat], height[~sat]

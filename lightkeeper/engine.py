@@ -39,15 +39,17 @@ import numpy as np
 
 from . import VERSION
 from . import clock, hotpix, runview
-from .devices import SIM_ID, OceanDevice, SimDevice, open_by_serial
+from .devices import levels, open_by_serial, open_device
 from .procs import read_json, write_json_atomic
 from .schedule import SETUP_FIELDS, RunPlan, burst_times, burst_us, dark_ladder_us, dark_scan_count, ladder_us, sun_events
 from .storage import LOCAL_TZ, Events, Writer, iso_local, local_dt, mono_ns, now_local, unique_dir, wall_ns
 
+# 16-bit defaults (Maya2000 Pro). 0.4.0: each device brings its own (devices.levels), scaled to its range; Engine.lv holds them.
 SAT_LEVEL = 60000.0
 STEP_DOWN_MAX = 55000.0
 TARGET_HIGH = 40000.0
 LOW_P995 = 15000.0
+SD_MANTISSA_BITS = 10            # 0.4.0: per-slot SD rounded to 10 mantissa bits (0.05 %), far below its own uncertainty
 N_LOW = 10
 BACKOFF_UP_SLOTS = 30          # 0.3.9: slots in a row that must fit under TARGET_HIGH at the next longer time
 AE_WINDOW_NM = (400.0, 1050.0)
@@ -61,11 +63,23 @@ WRITE_BACKLOG_BYTES = 512 * 2 ** 20   # acquisition pauses, logged, if the disk 
 MAX_HOT_PIXEL_SCANS = 200         # scans kept in memory for the hot-pixel search of a long dark set
 
 
-def _backoff_meta(plan):
+def _backoff_meta(plan, lv=None):
     if plan.auto_exposure or plan.backoff_step_ms <= 0:
         return None
-    return dict(step_ms=plan.backoff_step_ms, min_ms=plan.backoff_min_ms, from_ms=plan.int_ms, step_down_at=STEP_DOWN_MAX,
-                step_up_below=TARGET_HIGH, step_up_after_slots=BACKOFF_UP_SLOTS)
+    lv = lv or levels()
+    return dict(step_ms=plan.backoff_step_ms, min_ms=plan.backoff_min_ms, from_ms=plan.int_ms, step_down_at=lv["step_down"],
+                step_up_below=lv["target_high"], step_up_after_slots=BACKOFF_UP_SLOTS)
+
+
+def round_mantissa(a, bits=SD_MANTISSA_BITS):
+    """float32 copy of a with the mantissa rounded to `bits` bits (relative error <= 2**-(bits+1)). Compresses far better;
+    readers see ordinary float32."""
+    a = np.ascontiguousarray(a, dtype=np.float32)
+    i = a.view(np.uint32)
+    drop = 23 - bits
+    r = ((i + np.uint32(1 << (drop - 1))) >> np.uint32(drop)) << np.uint32(drop)
+    r = np.where(np.isfinite(a), r, i).astype(np.uint32)
+    return r.view(np.float32)
 
 
 def despiked(y):
@@ -99,6 +113,7 @@ class Engine(threading.Thread):
         self.auto = True
         self.backoff = False     # 0.3.9: fixed exposure with back-off (set per run)
         self.low_count = 0
+        self.lv = levels()       # 0.4.0: saturation and exposure thresholds of the open device
         self.darks: dict[int, np.ndarray] = {}
         self._quit = False
         self._last_scan_emit = 0
@@ -225,15 +240,15 @@ class Engine(threading.Thread):
     def _auto_exposure(self, bmax, p995, per_scan=False):
         lad = self._ladder(); cur = self.dev.int_us
         i = int(np.argmin(np.abs(np.array(lad) - cur)))
-        if bmax >= STEP_DOWN_MAX and cur > lad[0]:
-            target = cur * min(0.5, 0.8 * TARGET_HIGH / max(bmax, 1))
+        if bmax >= self.lv['step_down'] and cur > lad[0]:
+            target = cur * min(0.5, 0.8 * self.lv['target_high'] / max(bmax, 1))
             j = max([k for k, v in enumerate(lad) if v <= target] or [0])
             self.low_count = 0
             self._set_int(lad[j], f"peak {bmax:.0f} counts")
-        elif p995 < LOW_P995:
+        elif p995 < self.lv['low_p995']:
             self.low_count += 1
             if self.low_count >= (5 if per_scan else N_LOW) and cur < lad[-1]:
-                ok = [k for k, v in enumerate(lad) if v > cur and bmax * v / cur <= TARGET_HIGH]
+                ok = [k for k, v in enumerate(lad) if v > cur and bmax * v / cur <= self.lv['target_high']]
                 if ok:
                     self._set_int(lad[max(ok)], f"p99.5 {p995:.0f}, peak {bmax:.0f} counts")
                 self.low_count = 0
@@ -245,11 +260,11 @@ class Engine(threading.Thread):
         (never above the run's fixed time) after BACKOFF_UP_SLOTS slots in a row that would stay under TARGET_HIGH there."""
         lad = self.ctx["ladder"]; cur = self.dev.int_us
         lower = [v for v in lad if v < cur]; higher = [v for v in lad if v > cur]
-        if bmax >= STEP_DOWN_MAX:
+        if bmax >= self.lv['step_down']:
             self.low_count = 0
             if lower:
                 self._set_int(max(lower), f"back-off, peak {bmax:.0f} counts")
-        elif higher and bmax * min(higher) / cur <= TARGET_HIGH:
+        elif higher and bmax * min(higher) / cur <= self.lv['target_high']:
             self.low_count += 1
             if self.low_count >= BACKOFF_UP_SLOTS:
                 self.low_count = 0
@@ -264,14 +279,14 @@ class Engine(threading.Thread):
         if self.dev is not None:
             self._c_disconnect()
         try:
-            self.dev = SimDevice() if dev_id == SIM_ID else OceanDevice(dev_id, edc, nlc)
+            self.dev = open_device(dev_id, edc, nlc)
             self.dev.set_corrections(edc, nlc)
             self.dev.set_int(100_000)
         except Exception as e:
             self.dev = None
             self.emit("error", text=f"connect failed: {e!r}  (close OceanView; only one program can hold the spectrometer)")
             self.set_state("DISCONNECTED"); return
-        self.conn = (self.dev.serial, edc, nlc)
+        self.conn = (self.dev.serial, edc, nlc); self.lv = dict(getattr(self.dev, 'levels', None) or levels())
         self.emit("device", info=self.dev.info(), wavelengths=self.dev.wavelengths.copy())
         self._emit_saved_hot()
         self.set_state("IDLE", "connected")
@@ -290,7 +305,7 @@ class Engine(threading.Thread):
             self.dev = None
             self.emit("connect_failed", text=f"{e!r}")
             self.set_state("DISCONNECTED"); return
-        self.conn = (self.dev.serial, edc, nlc)
+        self.conn = (self.dev.serial, edc, nlc); self.lv = dict(getattr(self.dev, 'levels', None) or levels())
         self.emit("device", info=self.dev.info(), wavelengths=self.dev.wavelengths.copy())
         self._emit_saved_hot()
         self.set_state("IDLE", "connected")
@@ -421,10 +436,11 @@ class Engine(threading.Thread):
                         t_start.date(), plan.site_lat, plan.site_lon).items()},
                     time_note=f"all stored times are UTC ns; folder/file names use local time ({LOCAL_TZ})",
                     time_sync_status=time_sync_status(), format_version=FORMAT_VERSION,
-                    auto_exposure=dict(step_down_above=STEP_DOWN_MAX, target_high=TARGET_HIGH, low_p995=LOW_P995,
+                    auto_exposure=dict(step_down_above=self.lv['step_down'], target_high=self.lv['target_high'], low_p995=self.lv['low_p995'],
                                        n_low_slots=N_LOW, window_nm=AE_WINDOW_NM, discard_after_change=DISCARD),
-                    backoff=_backoff_meta(plan),
-                    saturation_level_counts=SAT_LEVEL,
+                    backoff=_backoff_meta(plan, self.lv),
+                    saturation_level_counts=self.lv['sat'], native_max_counts=info.get('native_max_counts'),
+                    sd_storage=f'float32, mantissa rounded to {SD_MANTISSA_BITS} bits (relative error <= {2 ** -(SD_MANTISSA_BITS + 1):.1e})',
                     exposure_timing_note="Maya2000Pro benchmark 2026-10-31: scan period = integration time (no dead time); "
                                          "each scan timestamp is the host time at return = end of that exposure")
         if plan.setup_photo:
@@ -445,7 +461,7 @@ class Engine(threading.Thread):
                         segment=0, dark_sets=[], pre_done=False, last_slot_ns=None, uncovered=False, temp=bool(temp_src))
         self.ctx["events"].defer = self.ctx["writer"].defer
         self.auto = plan.auto_exposure
-        self.backoff = _backoff_meta(plan) is not None; self.low_count = 0
+        self.backoff = _backoff_meta(plan, self.lv) is not None; self.low_count = 0
         self.emit("run", dir=str(run_dir), plan=plan.to_dict(), ladder_us=lad, t_start=t_start.isoformat(), t_stop=t_stop.isoformat())
         self.log("run_created", f"{run_dir}")
         if str(meta.get("setup_photo_copy", "")).startswith("failed"):
@@ -602,7 +618,7 @@ class Engine(threading.Thread):
         lad = sorted({int(u) for u in meta["ladder_us"]} | set(ladder_us(plan, self.dev.min_us, self.dev.max_us)))
         dl = sorted({int(u) for u in meta.get("dark_ladder_us", meta["ladder_us"])} | set(dark_ladder_us(plan, self.dev.min_us, self.dev.max_us)))
         widened = lad != [int(u) for u in meta["ladder_us"]]
-        meta.update(ladder_us=lad, dark_ladder_us=dl, backoff=_backoff_meta(plan))
+        meta.update(ladder_us=lad, dark_ladder_us=dl, backoff=_backoff_meta(plan, self.lv))
         if str(info.get("serial")) != str(meta.get("device", {}).get("serial")):
             self.emit("error", text=f"resume: device serial {info.get('serial')} differs from the run's {meta['device'].get('serial')}")
         attrs = dict(app=meta["app"], serial=info.get("serial", ""), model=info.get("model", ""), label=plan.label,
@@ -631,7 +647,7 @@ class Engine(threading.Thread):
                                                    gap_since_last_slot_s=gap_s, app=f"LightKeeper {VERSION}"))
         (run_dir / "run_metadata.json").write_text(json.dumps(meta, indent=1, default=str))
         self.auto = plan.auto_exposure
-        self.backoff = _backoff_meta(plan) is not None; self.low_count = 0
+        self.backoff = _backoff_meta(plan, self.lv) is not None; self.low_count = 0
         self.emit("run", dir=str(run_dir), plan=plan.to_dict(), ladder_us=lad, t_start=t_start.isoformat(), t_stop=t_stop.isoformat(),
                   resumed=True, segment=seg)
         self.log("resumed", f"segment {seg}; previous phase {st.get('phase')} ({st.get('status')}); last slot {st.get('last_slot_local')}"
@@ -792,7 +808,7 @@ class Engine(threading.Thread):
                 if raw:
                     raw["n"] += 1; raw["t1"] = t_ret
                     raw.setdefault("t0", t_ret)
-            m = float(despiked(y[win]).max()); bmax = max(bmax, m); nsat += int(m >= SAT_LEVEL)
+            m = float(despiked(y[win]).max()); bmax = max(bmax, m); nsat += int(m >= self.lv['sat'])
             self.emit_scan(y)
         if not stream:
             tw1 = wall_ns()
@@ -807,7 +823,7 @@ class Engine(threading.Thread):
                    p995_mean_window=np.float32(p995), n_saturated_scans=np.int16(nsat),
                    overrun_ms=np.float32(late_ns / 1e6), mean=mean.astype(np.float32))
         if p.store_sd:
-            row["sd"] = sd.astype(np.float32)
+            row["sd"] = round_mantissa(sd)
         temp = None
         if c.get("temp"):
             temp = self.dev.temperature_c()
