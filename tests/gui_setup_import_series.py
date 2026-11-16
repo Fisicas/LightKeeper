@@ -115,19 +115,36 @@ except Exception as e:
     drew = repr(e)
 check("drawing with a subset of panels works", drew is True and len(w.c_ts.ax) == 4, drew)
 
-# 4. several spectrometers: the window asks (auto_confirm picks the first; the last used one is offered first)
+# 4. several spectrometers (0.4.1): no question; the one used last opens, and picking another in the list switches to it
 w.dev_combo.clear()
 for i, lab in [("od:MAYP111000", "Maya2000 Pro  [MAYP111000]  (OceanDirect)"), ("sb:USB2G52537", "USB650  [USB2G52537]  (seabreeze)"),
-               (ui.SIM_ID, "Simulator")]:
+               (12, "Ocean device id 12, could not be opened (in use by another program?)  (OceanDirect)"), (ui.SIM_ID, "Simulator")]:
     w.dev_combo.addItem(lab, i)
 sent = []; w.engine.send = lambda *a: sent.append(a)
+dialogs = []; orig = Q.QInputDialog.getItem; Q.QInputDialog.getItem = staticmethod(lambda *a, **k: (dialogs.append(a), ("", False))[1])
 w._auto = True; w._auto_failed = None; w.state = "DISCONNECTED"; w.link = None; w._expect_attach = None
-w._auto_choice = 1; w._auto_connect()
-check("with two attached, the chosen one opens", sent and sent[-1][:2] == ("connect", "sb:USB2G52537"), sent)
-w._auto_choice = None
-orig = Q.QInputDialog.getItem; Q.QInputDialog.getItem = staticmethod(lambda *a, **k: ("", False))
-sent.clear(); w._auto_failed = None; w._auto_connect()
-check("cancel opens nothing and is not asked again", not sent and w._auto_failed == ("od:MAYP111000", "sb:USB2G52537"))
+w.settings.setValue("last_serial", "USB2G52537")
+w._auto_connect()
+check("the spectrometer used last opens, with no dialog", sent and sent[-1][:2] == ("connect", "sb:USB2G52537") and not dialogs, sent)
+w.settings.setValue("last_serial", "NOT_ATTACHED"); sent.clear(); w._auto_live = False; w._auto_connect()
+check("last one not attached: the first named one opens", sent and sent[-1][:2] == ("connect", "od:MAYP111000"), sent)
+check("an entry that could not be named is never opened automatically", all(a[1] != 12 for a in sent))
+# switching from the list while connected, and the live view coming back
+w._auto_live = False; w.info = dict(serial="MAYP111000"); w._set_state("PREVIEW"); sent.clear()
+w.dev_combo.setCurrentIndex(1); w._device_picked(1)
+check("picking another spectrometer switches to it", sent and sent[-1][:2] == ("connect", "sb:USB2G52537"), sent)
+for st in ("DISCONNECTED", "IDLE"):
+    w._handle(dict(type="state", state=st))
+check("the live view starts again on the new one", any(a[0] == "preview" and a[1] is True for a in sent) and w._switching is None, sent)
+w.info = dict(serial="USB2G52537"); w._set_state("PREVIEW"); sent.clear(); w._device_picked(1)
+check("picking the open one does nothing", not sent)
+w._set_state("RECORDING"); sent.clear(); w._device_picked(0)
+check("no switching during a run", not sent)
+w._set_state("DISCONNECTED")
+# nothing opens (and nothing is asked) before the splash has closed
+w2_started = w._started; w._started = False; sent.clear(); w._auto_failed = None; w._auto_live = False; w._auto_connect()
+check("nothing opens before start-up has finished", not sent)
+w._started = w2_started
 Q.QInputDialog.getItem = orig
 
 w.close(); app.processEvents()

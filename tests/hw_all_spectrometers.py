@@ -1,6 +1,6 @@
 """Hardware check (0.4.0): every attached spectrometer is found, by OceanDirect or seabreeze, and each one connects, gives live
 scans on its own count scale, disconnects, and reopens by serial (the background recorder's path). No run is recorded.
-Close OceanView first. Usage: python -X utf8 tests/hw_all_spectrometers.py"""
+Also leaves an unread reply on a Maya2000 Pro and checks it is recovered (0.4.1). Close OceanView first. Usage: python -X utf8 tests/hw_all_spectrometers.py"""
 import os
 import queue
 import sys
@@ -83,5 +83,33 @@ try:
 finally:
     engine.send("quit"); engine.join(timeout=15)
 check("engine shut down", not engine.is_alive())
+
+# 0.4.1: a reply left unread on an OceanDirect spectrometer made OceanDirect fail every open (OSError 0xe06d7363) until the
+# device was unplugged. Leave one on purpose, in another process, and check that a new process finds and opens it.
+import subprocess  # noqa: E402
+wedge = r'''
+import sys; sys.path.insert(0, sys.argv[1])
+from lightkeeper import devices as D
+D.seabreeze_backend()
+import usb.core, usb.util, libusb_package
+for d in usb.core.find(find_all=True, idVendor=0x2457, idProduct=int(sys.argv[2], 16), backend=libusb_package.get_libusb1_backend()):
+    i = d.get_active_configuration()[(0, 0)]; usb.util.claim_interface(d, i.bInterfaceNumber)
+    d.write(0x01, bytes([0x05, 0x00]), timeout=500)        # query information slot 0; the reply is never read
+    usb.util.release_interface(d, i.bInterfaceNumber); usb.util.dispose_resources(d)
+'''
+heal = r'''
+import sys; sys.path.insert(0, sys.argv[1])
+from lightkeeper import devices as D
+D.seabreeze_backend()
+devs, err = D.list_devices(False)
+print([i for i, _ in devs], err)
+'''
+root = str(Path(__file__).resolve().parents[1])
+for dev_id, lab in devs:
+    if "Maya2000 Pro" not in lab:
+        continue
+    subprocess.run([sys.executable, "-X", "utf8", "-c", wedge, root, "102A"], check=True, timeout=60)
+    r = subprocess.run([sys.executable, "-X", "utf8", "-c", heal, root], capture_output=True, text=True, timeout=120)
+    check("a Maya left with an unread reply is found and named again", dev_id in r.stdout, r.stdout.strip() or r.stderr[-300:])
 print("PASS" if ok else "FAILED")
 raise SystemExit(0 if ok else 1)

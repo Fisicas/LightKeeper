@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.1 (2026-11-15)
+- **Fixed: the splash could stay up for good.** In 0.4.0 the "Choose a spectrometer" question opened while the window was still
+  starting. The splash closes only when start-up ends, so it stayed on top and hid the question. Now nothing is asked and no
+  spectrometer is opened until the splash has closed. That includes the offer to resume an unfinished run.
+- **No question at start-up: the spectrometer used last opens.** With more than one attached, LightKeeper opens the one used last
+  (by serial), or else the first one found. The status bar says how many are attached. Pick another in the Spectrometer list to
+  switch: the open one closes, the new one opens and the live view starts again. You cannot switch during a run.
+- **Fixed: a Maya2000 Pro could not be opened until it was unplugged** (`OSError 0xe06d7363`, listed as "serial read after
+  connect"). It had an unread 3-byte reply queued on USB endpoint 0x81, and OceanDirect 3.1.4 fails every open while one is
+  waiting. Sending the Maya a command and never reading the reply reproduces it.
+  - **Stale input is now discarded first.** Before OceanDirect searches or opens anything, LightKeeper reads off whatever an
+    Ocean spectrometer still has queued. This covers the window, the recorder's reopen after a USB fault, and resume. It
+    must happen first: after one failed open, OceanDirect holds the device until the program exits. A spectrometer that
+    another program holds is skipped. This adds about 0.5 s to a device search.
+  - **seabreeze no longer opens a model that OceanDirect has already found** while listing, so its brief open cannot leave
+    such a reply.
+  - **A device that still cannot be opened** is listed as "could not be opened (in use by another program?)", with the reason
+    in the log. It is never opened automatically; Connect can still try it.
+  - `tests/hw_all_spectrometers.py` now leaves an unread reply on a Maya on purpose and checks that it is recovered.
+
 ## 0.4.0 (2026-11-15)
 - **Finds any Ocean spectrometer, Maya2000 Pro and USB650 included.** OceanDirect is searched first, then seabreeze (pyseabreeze over
   the existing WinUSB driver) adds the legacy models OceanDirect 3.1 does not open, such as the USB650. The separate
@@ -13,8 +33,7 @@
     largest count. 16-bit detectors keep 60,000 / 55,000 / 40,000 / 15,000. A 12-bit USB650 uses 3,749 / 3,437 / 2,499 / 937,
     the same as the compatibility copy. The live view's saturation line and the metadata (`native_max_counts`,
     `saturation_level_counts`) say which applies.
-  - **Several attached: you choose.** The window asks which one to open, offering the one used last first. Cancel leaves both
-    free until the set of attached spectrometers changes, and Connect still works.
+  - **Several attached:** the window asked which one to open (replaced in 0.4.1).
   - Devices are listed by model and serial (`Maya2000 Pro [MAYP111000] (OceanDirect)`). OceanDirect devices are opened by serial,
     because OceanDirect's numeric ids change at every USB rescan.
 - **Load setup from a run.** A new menu in the Run section lists the runs in the Save in folder and setups loaded before, plus

@@ -139,34 +139,92 @@ def shutdown_sdk():
         _SDK = None
 
 
-def _od_list():
-    """[(id, model, serial)] of the spectrometers OceanDirect can open; each is opened briefly to read its name
-    (OceanDirect 3.1 cannot read a serial number before the device is opened)."""
-    api, _ = sdk()
-    api.find_usb_devices()
+OCEAN_VID = 0x2457
+
+
+def drain_usb(log=None) -> int:
+    """0.4.1: read and discard whatever an Ocean spectrometer still has queued on its input pipes. A reply left unread
+    (a program stopped mid-command, or a probe) makes OceanDirect 3.1.4 fail every later open with a C++ exception
+    (OSError 0xe06d7363); on 15 Nov 2026 a Maya2000 Pro held 3 bytes on endpoint 0x81. It must run BEFORE OceanDirect
+    touches the device in this process: after one failed open OceanDirect keeps the device until the process exits
+    (tested: draining or restarting the SDK afterwards does not help). Devices another program holds, or this process has
+    open, are skipped (their interface cannot be claimed). Needs pyusb (seabreeze's); returns the bytes discarded."""
+    if seabreeze_backend() is None:
+        return 0
+    import libusb_package
+    import usb.core
+    import usb.util
+    total = 0
+    for d in usb.core.find(find_all=True, idVendor=OCEAN_VID, backend=libusb_package.get_libusb1_backend()) or ():
+        claimed = None
+        try:
+            intf = d.get_active_configuration()[(0, 0)]
+            usb.util.claim_interface(d, intf.bInterfaceNumber); claimed = intf.bInterfaceNumber
+            for ep in intf:
+                if usb.util.endpoint_direction(ep.bEndpointAddress) != usb.util.ENDPOINT_IN:
+                    continue
+                for _ in range(64):
+                    try:
+                        n = len(ep.read(16384, timeout=25))
+                    except usb.core.USBTimeoutError:
+                        break
+                    total += n
+                    if log and n:
+                        log(f"USB {d.idProduct:#06x} endpoint {ep.bEndpointAddress:#04x}: discarded {n} stale bytes")
+        except Exception:
+            pass
+        finally:
+            if claimed is not None:
+                _try(lambda: usb.util.release_interface(d, claimed))
+            _try(lambda: usb.util.dispose_resources(d))
+    return total
+
+
+def _od_open_names(api):
     out = []
     for i in api.get_device_ids():
-        i = int(i); model = serial = ""
+        i = int(i); model = serial = err = ""
         try:
             d = api.open_device(i)
             model = str(_try(d.get_model, "")); serial = str(_try(d.get_serial_number, ""))
-        except Exception:          # held by another program: still listed, named after connecting
-            pass
+        except Exception as e:     # held by another program (another LightKeeper window, OceanView) or a USB fault
+            err = repr(e)
         finally:
             _try(lambda: api.close_device(i))
-        out.append((i, model, serial))
+        out.append((i, model, serial, err))
     return out
 
 
-def _sb_list(skip_serials=()):
-    """[(id, model, serial)] of the spectrometers seabreeze can open over USB, except those already listed."""
+def _od_list():
+    """[(id, model, serial, error)] of the spectrometers OceanDirect finds; each is opened briefly to read its name
+    (OceanDirect 3.1 cannot read a serial number before the device is opened). Stale USB input is drained first."""
+    drain_usb()
+    api, _ = sdk()
+    api.find_usb_devices()
+    return _od_open_names(api)
+
+
+def _model_key(name: str) -> str:
+    """OceanDirect says 'MayaPro2000', seabreeze 'MAYA2000PRO': compare the letters and digits, in any order."""
+    return "".join(sorted(c for c in str(name).upper() if c.isalnum()))
+
+
+def _sb_list(skip_serials=(), skip_models=None):
+    """[(id, model, serial)] of the spectrometers seabreeze can open over USB, except those already listed.
+    0.4.1: a model OceanDirect already listed is not opened at all (as many of it as OceanDirect named): seabreeze's
+    brief open is what may leave a stray reply that OceanDirect cannot get past."""
     sb = seabreeze_backend()
     if sb is None:
         return []
+    skip = dict(skip_models or {})
     out = []
     for u in sb["transport"].list_devices():
         try:
             d = sb["factory"](u)
+            key = _model_key(getattr(d, "_model_name", "") or "")
+            if key and skip.get(key, 0) > 0:
+                skip[key] -= 1
+                continue
             d.open(); model, serial = str(d.model), str(d.serial_number); d.close()
         except Exception:          # in use (OceanDirect or another program holds it) or a USB error
             continue
@@ -184,14 +242,19 @@ def list_devices(include_sim: bool = True):
     """[(id, label)], error string or None. Do not call while a device is open.
     id: "od:<serial>" for OceanDirect (an int if its serial could not be read), "sb:<serial>" for seabreeze, SIM_ID for the
     simulator. Serials, not OceanDirect's integer ids: those change at every rescan, and seabreeze's search is one."""
-    out, errs, seen = [], [], set()
+    out, errs, seen, models = [], [], set(), {}
     try:
-        for i, model, serial in _od_list():
-            out.append((OD_PREFIX + serial if serial else i, device_label(model, serial, "OceanDirect"))); seen.add(serial)
+        for i, model, serial, e in _od_list():
+            if serial:
+                out.append((OD_PREFIX + serial, device_label(model, serial, "OceanDirect"))); seen.add(serial)
+                models[_model_key(model)] = models.get(_model_key(model), 0) + 1
+            else:                  # 0.4.1: listed (Connect can still try it) but never opened automatically
+                out.append((i, f"Ocean device id {i}, could not be opened (in use by another program?)  (OceanDirect)"))
+                errs.append(f"OceanDirect id {i} could not be opened: {e}")
     except Exception as e:  # SDK missing or USB error: seabreeze and the simulator still work
         errs.append(f"OceanDirect: {e!r}")
     try:
-        for i, model, serial in _sb_list(seen):
+        for i, model, serial in _sb_list(seen, models):
             out.append((i, device_label(model, serial, "seabreeze")))
         if seabreeze_backend() is None:
             errs.append(f"seabreeze: {seabreeze_error()}")
@@ -224,6 +287,8 @@ def open_by_serial(serial: str, edc: bool = True, nlc: bool = True, hint_id: int
     try:
         if "OceanDirect" not in backends:
             raise LookupError("not searched")
+        if drain_usb():                 # 0.4.1: before OceanDirect touches anything (see drain_usb)
+            seen.append("stale USB input discarded")
         api, _ = sdk()
         api.find_usb_devices()
         ids = [int(i) for i in api.get_device_ids()]

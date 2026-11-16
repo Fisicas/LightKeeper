@@ -282,6 +282,7 @@ class Window(Q.QMainWindow):
     def __init__(self, auto_confirm: bool = False, progress=None):
         """progress(step): optional, told what is starting (the splash); events are not processed until the timers below can run."""
         super().__init__()
+        self._started = progress is None          # a splash calls startup_finished() once it has closed
         progress = progress or (lambda step: None)
         progress(1)
         self.setWindowTitle(f"{APP_NAME} {VERSION}"); self.setWindowIcon(icon()); self.resize(1600, 960)
@@ -302,7 +303,9 @@ class Window(Q.QMainWindow):
         # like OceanView: open the first attached spectrometer and show single 100 ms scans, without pressing Connect.
         # Off after the user disconnects; a device that failed to open is not retried until the attached set changes.
         self._auto = os.environ.get("LIGHTKEEPER_AUTOCONNECT", "1") != "0"; self._auto_live = False; self._auto_failed = None; self._last_auto_try = 0.0
-        self._auto_choice = 0 if auto_confirm else None
+        # 0.4.1: questions (resume a run) and opening a spectrometer wait until the splash has closed; a dialog shown under the
+        # stay-on-top splash held start-up open, so the splash never closed. No splash (tests): started at once.
+        self._on_started = []; self._switching = None
         self._build()
         self.setAcceptDrops(True); Q.QApplication.instance().installEventFilter(self)
         self.exp_mode.setCurrentIndex(1); self.int_spin.setValue(LIVE_START_MS)
@@ -315,7 +318,7 @@ class Window(Q.QMainWindow):
         self.slow = QtCore.QTimer(self); self.slow.timeout.connect(self._slow_tick); self.slow.start(1000)
         if not self._try_attach():
             self._refresh_devices()
-            QtCore.QTimer.singleShot(700, self._offer_resume)
+            self._when_started(lambda: QtCore.QTimer.singleShot(700, self._offer_resume))
         self._update_schedule()
 
     # =================================================================== layout
@@ -532,6 +535,7 @@ class Window(Q.QMainWindow):
 
         section(lay, "Spectrometer")
         self.dev_combo = Combo(); lay.addWidget(self.dev_combo)
+        self.dev_combo.activated.connect(self._device_picked)
         self.btn_refresh = Q.QPushButton("Refresh"); self.btn_connect = Q.QPushButton("Connect")
         lay.addWidget(hbox(self.btn_refresh, self.btn_connect, stretch_first=False))
         self.cb_edc = Q.QCheckBox("Electric dark correction"); self.cb_nlc = Q.QCheckBox("Nonlinearity correction")
@@ -1510,7 +1514,12 @@ class Window(Q.QMainWindow):
                 self._on_slot(e)
             elif t == "state":
                 self._set_state(e["state"], e.get("detail", ""))
-                if self._auto_live and e["state"] == "IDLE":
+                if self._switching == "closing" and e["state"] == "DISCONNECTED":
+                    self._switching = "opening"       # the old spectrometer closed; the new one opens next
+                elif self._switching == "opening" and e["state"] == "DISCONNECTED":
+                    self._switching = None; self._auto_live = False    # it did not open: Connect, or pick another
+                elif self._auto_live and e["state"] == "IDLE":
+                    self._switching = None
                     self._auto_live = False; self._auto_failed = None
                     self.engine.send("preview", True, False, self.int_spin.value())
                 elif self._auto_live and e["state"] == "DISCONNECTED":
@@ -1661,7 +1670,7 @@ class Window(Q.QMainWindow):
 
     def _auto_connect(self, rescan=False):
         """Connect the first attached Ocean spectrometer (never the simulator) and start the live view."""
-        if not self._auto or self.link is not None or self._expect_attach is not None or self.state != "DISCONNECTED":
+        if not self._started or not self._auto or self.link is not None or self._expect_attach is not None or self.state != "DISCONNECTED":
             return
         if rescan:
             if live_sessions() or watched_runs():   # 0.3.11: a run the watchdog is about to resume needs the spectrometer free
@@ -1672,32 +1681,54 @@ class Window(Q.QMainWindow):
                 for i, lab in devs:
                     self.dev_combo.addItem(lab, i)
         ids = [self.dev_combo.itemData(k) for k in range(self.dev_combo.count())]
-        real = [i for i in ids if i is not None and i != SIM_ID]
+        # 0.4.1: only spectrometers that could be named (opened briefly while listing); an unnamed one is in use or faulty
+        real = [i for i in ids if isinstance(i, str)]
         if not real or tuple(real) == self._auto_failed:
             return
-        pick = real[0]
-        if len(real) > 1:                      # 0.4.0: more than one spectrometer attached: ask which one
-            pick = self._choose_device(real)
-            if pick is None:
-                self._auto_failed = tuple(real)    # not asked again until the attached set changes; Connect still works
-                self._log("several spectrometers attached; none chosen. Pick one in the list and press Connect.")
-                return
+        pick = self._last_used(real)           # 0.4.1: the spectrometer used last, if attached; else the first found
         self.dev_combo.setCurrentIndex(ids.index(pick)); self._auto_live = tuple(real)
         self._log(f"opening {self.dev_combo.currentText().strip()} automatically; live view at {LIVE_START_MS} ms")
+        if len(real) > 1:
+            self.statusBar().showMessage(f"{len(real)} spectrometers attached: opened {self.dev_combo.currentText().split('  (')[0].strip()}. "
+                                         "Pick another in the Spectrometer list to switch.", 15000)
         self.engine.send("connect", pick, self.cb_edc.isChecked(), self.cb_nlc.isChecked())
 
-    def _choose_device(self, real):
-        """Ask which of several attached spectrometers to open; the one used last is offered first. None = cancelled."""
-        labels = [self.dev_combo.itemText(self.dev_combo.findData(i)) for i in real]
+    def _when_started(self, fn):
+        """Run fn now if start-up is over, else when the splash has closed."""
+        if self._started:
+            fn()
+        else:
+            self._on_started.append(fn)
+
+    def startup_finished(self):
+        """Called once the splash has closed (splash.start): now the window may ask questions."""
+        if self._started:
+            return
+        self._started = True
+        for fn in self._on_started:
+            fn()
+        self._on_started.clear()
+
+    def _last_used(self, real):
+        """Of the attached spectrometer ids, the one whose serial was used last (settings 'last_serial'), else the first."""
         last = str(self.settings.value("last_serial", "") or "")
-        first = next((k for k, lab in enumerate(labels) if last and f"[{last}]" in lab), 0)
-        if self._auto_choice is not None:      # tests and --auto-confirm
-            return real[min(self._auto_choice, len(real) - 1)]
-        item, ok = Q.QInputDialog.getItem(self, "Choose a spectrometer",
-                                          f"{len(real)} spectrometers are attached. Which one should LightKeeper open?\n"
-                                          "(Only one program can hold a spectrometer; the other stays free.)",
-                                          labels, first, False)
-        return real[labels.index(item)] if ok and item in labels else None
+        for i in real:
+            if last and f"[{last}]" in self.dev_combo.itemText(self.dev_combo.findData(i)):
+                return i
+        return real[0]
+
+    def _device_picked(self, k):
+        """0.4.1: choosing another spectrometer in the list while one is open switches to it (not during a run)."""
+        dev_id = self.dev_combo.itemData(k)
+        if dev_id is None or self.state == "DISCONNECTED" or self.state in RUN_STATES or self.link is not None:
+            return                            # disconnected: Connect opens the one chosen
+        cur = (self.info or {}).get("serial", "")
+        if cur and f"[{cur}]" in self.dev_combo.itemText(k):
+            return
+        self._log(f"switching to {self.dev_combo.itemText(k).strip()}")
+        self._auto_live = (dev_id,)           # start the live view again once it is open
+        self._switching = "closing"
+        self.engine.send("connect", dev_id, self.cb_edc.isChecked(), self.cb_nlc.isChecked())
 
     def _resume_dialog(self):
         runs = [r for r in open_runs() if not supervisor_alive(r["run_dir"])]

@@ -63,6 +63,7 @@ check("every step ran, in order", seen == [0, 1, 2, 3, 4], seen)
 check("the ring kept turning while the libraries loaded", frames_at[1] - frames_at[0] >= 5, f"{frames_at[1] - frames_at[0]} frames")
 check("the main window is open", w.isVisible())
 check("the splash is still up for a moment, with every row checked", sp.isVisible() and all(s[0] == "done" for s in sp.steps))
+check("0.4.1: the window waits for the splash before it opens a spectrometer or asks anything", w._started is False)
 check("every row has its time", all(s[2] is not None and s[2] >= 0 for s in sp.steps), [round(s[2], 2) for s in sp.steps])
 if SHOTS:
     sp.grab().save(str(SHOTS / "splash_finished.png"))
@@ -72,6 +73,7 @@ while time.monotonic() < end and sp.isVisible():
     app.processEvents(); time.sleep(0.01)
 closed_after = time.monotonic()
 check("the splash closes by itself", not sp.isVisible())
+check("0.4.1: once it has closed, the window may open a spectrometer and ask questions", w._started is True)
 check("the main window stays open", w.isVisible())
 check("nothing else is left open", [x for x in app.topLevelWidgets() if x.isVisible() and x is not w] == [],
       [type(x).__name__ for x in app.topLevelWidgets() if x.isVisible() and x is not w])

@@ -217,7 +217,9 @@ def start(argv=None, use_splash: bool = True):
             splash.close()
         raise
     if splash:
-        splash.finish(then=lambda: (w.raise_(), w.activateWindow()))
+        splash.finish(then=lambda: (w.raise_(), w.activateWindow(), w.startup_finished()))
+    else:
+        w.startup_finished()
     return app, w, splash
 
 

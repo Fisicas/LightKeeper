@@ -59,7 +59,7 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
 LightKeeper finds Ocean spectrometers on USB through two backends. It tries Ocean Insight's **OceanDirect SDK** first. Then
 **seabreeze** adds the legacy models OceanDirect does not open, such as the **USB650**. It has been run on a **Maya2000 Pro**
 (OceanDirect) and a **USB650** (seabreeze). Other models should work, but are untested; please open an issue with what you try.
-If more than one is attached, the window asks which to open.
+If more than one is attached, it opens the one used last; pick another in the Spectrometer list to switch.
 
 - **seabreeze:** if it is not installed, the window installs it once into `%LOCALAPPDATA%\LightKeeper\deps`, leaving the Python
   environment unchanged. This needs internet access the first time. Saturation and exposure thresholds scale to each
