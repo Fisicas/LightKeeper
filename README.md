@@ -81,6 +81,8 @@ You need:
 
 1. **Launch.** Double-click `Launch_LightKeeper.cmd`. It uses `LIGHTKEEPER_PYTHON`, or else the first `pythonw.exe` on PATH.
    For a Start menu or desktop shortcut, `LightKeeper.ico` in the same folder is the app's icon.
+   Launching it again restores and brings forward the existing window, including any open question. Only one window opens per
+   settings home (`LIGHTKEEPER_HOME`, or the default local app-data folder); background recording continues independently.
 2. **Live view.** Connect, start the live view, aim the fiber and check the exposure.
 3. **Plan.** Fill in the run: label, site, start and stop, and the setup fields. Then check the **Schedule** tab.
 4. **Start run…** Cover the input for the pre-run dark set. Uncover it when asked, then press **Continue**. The run

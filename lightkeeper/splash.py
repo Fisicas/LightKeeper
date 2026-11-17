@@ -184,7 +184,7 @@ def _load_libraries(splash: SplashScreen | None):
         raise box["error"]
 
 
-def start(argv=None, use_splash: bool = True):
+def start(argv=None, use_splash: bool = True, on_ready=None):
     """Build and show everything; returns (app, window, splash). The caller runs app.exec()."""
     argv = sys.argv if argv is None else argv
     try:
@@ -216,20 +216,35 @@ def start(argv=None, use_splash: bool = True):
         if splash:                       # never leave a stay-on-top splash behind a failure
             splash.close()
         raise
-    if splash:
-        splash.finish(then=lambda: (w.raise_(), w.activateWindow(), w.startup_finished()))
-    else:
+    def ready():
+        w.raise_(); w.activateWindow()
+        if on_ready:
+            on_ready(w)
         w.startup_finished()
+    if splash:
+        splash.finish(then=ready)
+    else:
+        ready()
     return app, w, splash
 
 
 def main(argv=None) -> int:
     argv = sys.argv if argv is None else argv
+    from .instance import WindowInstance, activate_legacy_window
+    app = Q.QApplication.instance() or Q.QApplication(argv)
+    guard = None
     try:
-        app, w, _ = start(argv, use_splash="--no-splash" not in argv and os.environ.get("LIGHTKEEPER_SPLASH", "1") != "0")
+        guard = WindowInstance(app)
+        if not guard.acquire() or activate_legacy_window():
+            return 0
+        app, w, _ = start(argv, use_splash="--no-splash" not in argv and os.environ.get("LIGHTKEEPER_SPLASH", "1") != "0",
+                          on_ready=guard.ready)
+        return app.exec()
     except Exception:                    # pythonw has no console, so a start-up failure would otherwise vanish silently
         text = traceback.format_exc()
         print(text, file=sys.stderr)
         Q.QMessageBox.critical(None, f"{APP_NAME} could not start", text[-3000:])
         return 1
-    return app.exec()
+    finally:
+        if guard:
+            guard.close()

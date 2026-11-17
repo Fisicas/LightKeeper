@@ -1503,6 +1503,9 @@ class Window(Q.QMainWindow):
             self._cmd("stop")
 
     def _ask_uncover(self):
+        if not self._started:
+            self._when_started(self._ask_uncover)
+            return
         if self.state != "AWAIT_UNCOVER" or self._dialog:
             return
         self._ask("Uncover the input", "Pre-run dark set recorded.\n\nRemove the cover WITHOUT moving the fiber/diffuser, then press Continue.\n"
@@ -1511,6 +1514,9 @@ class Window(Q.QMainWindow):
             self._cmd("continue")
 
     def _ask_post_dark(self):
+        if not self._started:
+            self._when_started(self._ask_post_dark)
+            return
         if self.state != "POST_RUN" or self._dialog:
             return
         if self._ask("Post-run dark set", "Recording has finished.\n\nCover the input completely, then press Record to take the post-run dark set "
@@ -1736,7 +1742,7 @@ class Window(Q.QMainWindow):
         """Run fn now if start-up is over, else when the splash has closed."""
         if self._started:
             fn()
-        else:
+        elif fn not in self._on_started:
             self._on_started.append(fn)
 
     def startup_finished(self):
@@ -2462,12 +2468,5 @@ class Window(Q.QMainWindow):
 
 
 def main(argv=None):
-    argv = sys.argv if argv is None else argv
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LightKeeper.Window")
-    except Exception:
-        pass
-    app = Q.QApplication(argv); theme.apply(app); app.setWindowIcon(icon())
-    w = Window(auto_confirm="--auto-confirm" in argv); w.show()
-    return app.exec()
+    from .splash import main as launch
+    return launch(argv)

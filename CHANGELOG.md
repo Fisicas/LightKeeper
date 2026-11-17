@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.3 (2026-11-16)
+- **One window per settings home.** Launching LightKeeper again restores and raises the existing window (or its active modal
+  question), then exits without showing another splash, loading the plotting libraries, or discovering devices. Launches during
+  startup are remembered until the first splash closes. A process lock prevents simultaneous launches from creating two UIs;
+  a crashed UI's lock is recovered automatically. Background recorders, supervisors, and watchdogs remain independent.
+- **Fixed: recorder questions could still block the splash.** Attaching to a recorder in POST_RUN or AWAIT_UNCOVER could open
+  its dark-set or uncover question before the splash finished. Both questions now wait for startup to finish, duplicate startup
+  requests are coalesced, and each question rechecks the recorder state before sending any command.
+- On Windows, an updated launch can also restore an already-running older window in the default settings profile.
+- Regression checks: `tests/test_single_instance.py` and `tests/gui_startup_recorder_prompts.py`; native Windows focus can be
+  checked with `LIGHTKEEPER_INSTANCE_VISIBLE=1` for the minimized-window/modal test. Tests use isolated settings and no hardware.
+
 ## 0.4.2 (2026-11-15)
 - **Full scale.** A new button next to Fit y shows the whole wavelength range. Counts run from 0 to just above the detector's largest
   count: 64,000 on a Maya2000 Pro, 4,095 on a USB650. The saturation line is always in view, so you can see how much headroom a
