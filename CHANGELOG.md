@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.4 (2026-11-25)
+
+- Remember run folders by Windows volume identity and volume-relative path. Resolve a changed drive letter before opening or writing a run.
+- Recover eligible armed or interrupted acquisitions after Windows sign-in using the run-scoped watchdog task. Idle viewing does not register a Startup Apps entry.
+- Export a linear raw-count spectrogram and a log₁₀ counts/s spectrogram at run close. Both plots show recording gaps and use the original detector wavelength coordinates.
+- Export an end-of-run overview with the visible count rate, spectral ratios, exposure, saturation, and recording gaps on a shared time axis.
+- Add **Fit X/Y**, a full detector-channel display option, and repeated saves of fresh live scans. Keep the sidebar viewport stable and defer periodic plot redraws while it is scrolling.
+- Show blue:green with narrow red:far-red by default. Far-red share, NIR/red, and O₂-A depth remain available as optional traces.
+
 ## 0.4.3 (2026-11-16)
 - **One window per settings home.** Launching LightKeeper again restores and raises the existing window (or its active modal
   question), then exits without showing another splash, loading the plotting libraries, or discovering devices. Launches during

@@ -152,6 +152,61 @@ class TestResumeAfterStop(unittest.TestCase):
             print(f"\n  resumed after stop: {len(segs)} slots (segment 0 only), recording_end {meta.get('recording_end_local')}")
 
 
+class TestWindowsRecovery(unittest.TestCase):
+    def test_restart_resume_appends_a_new_segment_with_provenance(self):
+        from lightkeeper.procs import read_json, write_json_atomic
+
+        with tempfile.TemporaryDirectory() as td:
+            engine = Engine()
+            engine.start()
+            try:
+                events = []
+                engine.send("connect", SIM_ID, True, True)
+                wait_for(engine, lambda e: e["type"] == "device", 10, events)
+                now = dt.datetime.now(LOCAL_TZ)
+                plan = RunPlan(label="restart journal", out_dir=td, start_now=True, burst_every_min=0,
+                               pre_darks=False, post_darks=False, flush_s=1,
+                               stop_local=(now + dt.timedelta(seconds=45)).isoformat())
+                engine.send("start", plan.to_dict())
+                run = Path(wait_for(engine, lambda e: e["type"] == "run", 10, events)["dir"])
+                wait_for(engine, lambda e: e["type"] == "slot" and e["n_slots"] >= 2, 15, events)
+                engine.send("interrupt")
+                wait_for(engine, lambda e: e["type"] == "run_interrupted", 10, events)
+                state_file = run / "run_state.json"
+                state = read_json(state_file)
+
+                engine.send("resume", str(run), "windows_restart")
+                wait_for(engine, lambda e: e["type"] == "resume_refused", 10, events)
+                self.assertEqual(read_json(state_file)["status"], "interrupted")
+
+                # Recreate the journal a restarted Windows session sees, with the initial HDF5 rows on disk.
+                write_json_atomic(state_file, dict(state, status="open"))
+                before = {}
+                for f in run.glob("spectra_*.h5"):
+                    with h5py.File(f, "r") as h:
+                        before[f] = h["blocks/mean"][:]
+                self.assertGreaterEqual(sum(len(y) for y in before.values()), 2)
+
+                engine.send("resume", str(run), "windows_restart")
+                resumed = wait_for(engine, lambda e: e["type"] == "run" and e.get("resumed"), 10, events)
+                self.assertEqual(resumed["segment"], 1)
+                wait_for(engine, lambda e: e["type"] == "slot", 15, events)
+                engine.send("stop")
+                wait_for(engine, lambda e: e["type"] == "run_closed", 20, events)
+                self.assertEqual(read_json(run / "run_metadata.json")["resumes"][0]["source"], "windows_restart")
+                self.assertEqual(read_json(state_file)["status"], "closed")
+                segments = set()
+                for f in run.glob("spectra_*.h5"):
+                    with h5py.File(f, "r") as h:
+                        segments.update(h["blocks/segment"][:])
+                        if f in before:
+                            np.testing.assert_array_equal(h["blocks/mean"][:len(before[f])], before[f])
+                self.assertEqual(segments, {0, 1})
+            finally:
+                engine.send("quit")
+                engine.join(10)
+
+
 class TestBurstSkip(unittest.TestCase):
     """0.3.1: a burst whose predicted fill is < 1 % of full scale is skipped and logged, not run."""
     def _ctx(self, p995):

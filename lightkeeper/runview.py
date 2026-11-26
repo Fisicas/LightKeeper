@@ -40,26 +40,78 @@ def band_metrics(rate, masks):
         return dict(par=m["par"], rfr=m["red"] / m["fr"], nirred=m["nir"] / m["red2"], o2a=np.where(sh != 0, 1 - m["o2"] / sh, np.nan))
 
 
-def run_darks(files) -> tuple[dict, str]:
-    """Mean dark per integration time from the run's pre-run dark set (else its last dark set)."""
-    rows = []
+def broad_band_weights(wl, valid=None):
+    """Overlap-weighted detector count integrals over blue, green, far-red and 400–750 nm."""
+    wl = np.asarray(wl, float)
+    weights = np.zeros((len(wl), 4))
+    if len(wl) < 2 or not np.all(np.isfinite(wl)):
+        return weights
+    spacing = np.diff(wl)
+    if not (np.all(spacing > 0) or np.all(spacing < 0)):
+        return weights
+    edges = np.r_[wl[0] - spacing[0] / 2, (wl[:-1] + wl[1:]) / 2, wl[-1] + spacing[-1] / 2]
+    left = np.minimum(edges[:-1], edges[1:]); right = np.maximum(edges[:-1], edges[1:])
+    for i, (lo, hi) in enumerate(((420, 490), (500, 570), (700, 750), (400, 750))):
+        overlap = np.maximum(0, np.minimum(right, hi) - np.maximum(left, lo))
+        if valid is not None:
+            overlap[~valid] = 0
+        width = overlap.sum()
+        if width >= 0.9 * (hi - lo):
+            weights[:, i] = overlap * ((hi - lo) / width)
+    return weights
+
+
+def broad_metrics(rate, weights, eligible):
+    """Instrument-relative count ratios with matched darks and unsaturated, positive bands."""
+    b, g, f, all_light = (rate @ weights).T
+    bg = np.full(len(rate), np.nan)
+    frshare = np.full(len(rate), np.nan)
+    np.divide(b, g, out=bg, where=eligible & (b > 0) & (g > 0))
+    np.divide(f, all_light, out=frshare, where=eligible & (f > 0) & (all_light >= f))
+    return bg, frshare
+
+
+def _run_dark_sets(files):
+    sets: dict[tuple, dict] = {}
     for f in files:
         with h5py.File(f, "r") as h:
             if "dark_scans" in h:
                 g = h["dark_scans"]
                 lab = [x.decode() if isinstance(x, bytes) else str(x) for x in g["label"][:]]
-                rows += list(zip(g["session"][:], lab, g["int_us"][:], g["spectrum"][:]))
-    if not rows:
+                for session, label, us, y in zip(g["session"][:], lab, g["int_us"][:], g["spectrum"][:]):
+                    sets.setdefault((int(session), label), {}).setdefault(int(us), []).append(y)
+    return sets
+
+
+def _selected_dark_set(sets):
+    sessions = sorted(sets)
+    return next((s for s in sessions if s[1] == "pre"), sessions[-1])
+
+
+def run_darks(files) -> tuple[dict, str]:
+    """Mean dark per integration time from the run's pre-run dark set (else its last dark set)."""
+    sets = _run_dark_sets(files)
+    if not sets:
         return {}, "none"
-    sessions = sorted({(int(s), l) for s, l, _, _ in rows})
-    pre = [s for s, l in sessions if l == "pre"]
-    sid = pre[0] if pre else sessions[-1][0]
-    acc: dict[int, list] = {}
-    for s, _, u, y in rows:
-        if int(s) == sid:
-            acc.setdefault(int(u), []).append(y)
-    label = next(l for s, l in sessions if s == sid)
-    return {u: np.mean(v, 0) for u, v in acc.items()}, f"{label}-run dark set (session {sid})"
+    session, label = key = _selected_dark_set(sets)
+    return {u: np.mean(scans, axis=0) for u, scans in sets[key].items()}, f"{label}-run dark set (session {session})"
+
+
+def log_display_darks(files):
+    """Matching mean darks and a conservative pixel-wise display floor in counts."""
+    sets = _run_dark_sets(files)
+    if not sets:
+        return {}, {}, "none"
+    session, label = key = _selected_dark_set(sets)
+    post = next((sets[s] for s in sorted(sets, reverse=True) if s[1] == "post" and s[0] > session), {})
+    means, floors = {}, {}
+    for us, scans in sets[key].items():
+        mean = means[us] = np.mean(scans, axis=0)
+        floor = 5 * np.std(scans, axis=0, ddof=1) if len(scans) > 1 else np.zeros_like(mean)
+        if us in post:
+            floor = np.maximum(floor, 2 * np.abs(np.mean(post[us], axis=0) - mean))
+        floors[us] = floor
+    return means, floors, f"{label}-run dark set (session {session})"
 
 
 def _dark_for(darks, us, n_px):
@@ -76,12 +128,13 @@ def load_run(run_dir, valid=None, progress=None) -> dict:
         raise FileNotFoundError(f"no spectra_*.h5 files in {run_dir}")
     darks, dark_src = run_darks(files)
     sizes = []
-    wl = None; hot = []
+    wl = None; hot = []; model = ""
     for f in files:
         with h5py.File(f, "r") as h:
             sizes.append(h["blocks/mean"].shape[0] if "blocks" in h else 0)
             if wl is None and "wavelength_nm_device" in h:
                 wl = h["wavelength_nm_device"][:]
+                model = h.attrs.get("model", "")
             if not hot and "hot_pixels" in h.attrs:
                 try:
                     import json
@@ -96,6 +149,7 @@ def load_run(run_dir, valid=None, progress=None) -> dict:
         if hot:
             valid[[i for i in hot if 0 <= i < len(wl)]] = False
     masks = band_masks(wl, valid)
+    weights = broad_band_weights(wl, valid)
     stride = max(1, math.ceil(total / MAX_SPECTRA))
     slots, spectra, done, k = [], [], 0, 0
     for f, n in zip(files, sizes):
@@ -112,18 +166,20 @@ def load_run(run_dir, valid=None, progress=None) -> dict:
                 d = np.stack([_dark_for(darks, u, mean.shape[1]) for u in it[z]])
                 rate = (mean - d) / (it[z][:, None] / 1e6)
                 met = band_metrics(rate, masks)
+                eligible = (sat[z] == 0) & np.isin(it[z], list(darks))
+                bg, frshare = broad_metrics(rate, weights, eligible)
                 for j in range(mean.shape[0]):
                     i = a + j; tl = local_dt(int(t[i]))
                     slots.append(dict(t=tl, int_ms=it[i] / 1000, n=int(ns[i]), peak=float(pk[i]), nsat=int(sat[i]),
                                       par=float(met["par"][j]), rfr=float(met["rfr"][j]), nirred=float(met["nirred"][j]),
-                                      o2a=float(met["o2a"][j])))
+                                      o2a=float(met["o2a"][j]), bg=float(bg[j]), frshare=float(frshare[j])))
                     if k % stride == 0:
                         spectra.append((tl, rate[j].astype(np.float32), mean[j].astype(np.float32)))
                     k += 1
                 done += mean.shape[0]
                 if progress:
                     progress(done / total)
-    return dict(name=run_dir.name, dir=str(run_dir), slots=slots, spectra=spectra, stride=stride, wl=wl, valid=valid,
+    return dict(name=run_dir.name, dir=str(run_dir), slots=slots, spectra=spectra, stride=stride, wl=wl, valid=valid, model=model,
                 darks=darks, dark_source=dark_src, files=[f.name for f in files], n_slots=total)
 
 
@@ -204,7 +260,11 @@ def summarize(run_dir, meta: dict) -> dict:
     temp = temp[np.isfinite(temp)]
     import csv
     import re
-    rows = list(csv.reader((run_dir / "events.csv").open(encoding="utf-8"))) if (run_dir / "events.csv").exists() else []
+    events = run_dir / "events.csv"
+    rows = []
+    if events.exists():
+        with events.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
     skipped = sum(1 for r in rows if len(r) > 2 and r[2] == "burst_skipped")
     bursts = meta.get("bursts_done") or []
     if not bursts:                  # runs before 0.3.8: the burst_start/burst_end events carry the same numbers

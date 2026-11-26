@@ -117,6 +117,7 @@ class RunPlan:
     auto_resume_logon: bool = True   # 0.2.0: if Windows restarts during the run, resume it at the next logon
     resolved_start_local: str = ""   # 0.2.0: start/stop exactly as confirmed in the window (sun events resolved once, there)
     resolved_stop_local: str = ""
+    out_dir_location: dict | None = None  # selected volume and relative path, checked again before run creation
 
     def to_dict(self):
         return dc.asdict(self)
@@ -308,7 +309,8 @@ def estimates(plan: RunPlan, n_pixels: int, dev_min_us: int, dev_max_us: int,
     total = slot_bytes + (burst_scans + dark_scans) * per_spec
     expected = slot_bytes * EXPECTED_SLOT_RATIO + (lit * RAW_FRAME_DUTY + dark_scans) * per_spec * EXPECTED_RAW_RATIO
     try:
-        free = shutil.disk_usage(Path(plan.out_dir) if Path(plan.out_dir).exists() else Path(plan.out_dir).anchor).free
+        path = Path(plan.out_dir)
+        free = shutil.disk_usage(path if path.exists() else path.anchor).free if plan.out_dir else float("nan")
     except Exception:
         free = float("nan")
     return dict(start=t0, stop=t1, duration_h=dur / 3600, slots=int(slots), ladder_ms=[u / 1000 for u in lad],

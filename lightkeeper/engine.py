@@ -40,7 +40,8 @@ import numpy as np
 from . import VERSION
 from . import clock, hotpix, runview
 from .devices import levels, open_by_serial, open_device
-from .procs import read_json, write_json_atomic
+from .locations import resolve_path
+from .procs import WATCHDOG_RESTART_PHASES, read_json, write_json_atomic
 from .schedule import SETUP_FIELDS, RunPlan, burst_times, burst_us, dark_ladder_us, dark_scan_count, ladder_us, sun_events
 from .storage import LOCAL_TZ, Events, Writer, iso_local, local_dt, mono_ns, now_local, unique_dir, wall_ns
 
@@ -415,7 +416,11 @@ class Engine(threading.Thread):
         t_start, t_stop = plan.start_dt(), plan.stop_dt()
         if t_stop <= max(t_start, now_local()):
             self.emit("error", text="stop time must be after the start time and in the future"); return
-        out = Path(plan.out_dir); out.mkdir(parents=True, exist_ok=True)
+        out = resolve_path(plan.out_dir_location if plan.out_dir_location is not None else plan.out_dir)
+        if out is None:
+            self.emit("error", text="The selected run folder is unavailable. Reconnect its drive or choose a folder."); return
+        plan.out_dir = str(out)
+        out.mkdir(parents=True, exist_ok=True)
         safe_label = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in plan.label).strip("_") or "run"
         run_dir = unique_dir(out / f"{t_start:%Y-%m-%d}_{safe_label}"); run_dir.mkdir(parents=True)
         self.dev.set_corrections(plan.edc, plan.nlc)
@@ -602,7 +607,7 @@ class Engine(threading.Thread):
                 self.emit("error", text=f"reading darks from {f.name}: {e!r}")
         return {u: np.mean(v, 0) for u, v in acc.items()}
 
-    def _c_resume(self, run_dir):
+    def _c_resume(self, run_dir, source="manual"):
         run_dir = Path(run_dir)
         if self.dev is None or self.ctx is not None:
             self.emit("resume_refused", text="connect the spectrometer first (and no other run may be active)"); return
@@ -612,15 +617,24 @@ class Engine(threading.Thread):
                                              f"0.1.x cannot be resumed)"); return
         if st.get("status") == "closed":
             self.emit("resume_refused", text=f"{run_dir.name} is already closed"); return
+        if source != "manual" and (st.get("status") != "open" or (run_dir / "watchdog_off.json").exists()):
+            self.emit("resume_refused", text=f"{run_dir.name} is not set to resume automatically"); return
         plan = RunPlan.from_dict(meta["plan"])
         t_start = dt.datetime.fromisoformat(meta["planned_start_local"]); t_stop = dt.datetime.fromisoformat(meta["planned_stop_local"])
         info = self.dev.info()
+        if str(info.get("serial")) != str(meta.get("device", {}).get("serial")):
+            self.emit("resume_refused", text=f"Device serial {info.get('serial')} differs from the run's "
+                                            f"{meta.get('device', {}).get('serial')}")
+            return
+        if source == "windows_restart":
+            if not plan.auto_resume_logon or st.get("phase") not in WATCHDOG_RESTART_PHASES:
+                self.emit("resume_refused", text="The run is not set to resume after a Windows restart."); return
+            if now_local() >= t_stop:
+                self.emit("resume_refused", text="The scheduled stop passed before the spectrometer became available."); return
         lad = sorted({int(u) for u in meta["ladder_us"]} | set(ladder_us(plan, self.dev.min_us, self.dev.max_us)))
         dl = sorted({int(u) for u in meta.get("dark_ladder_us", meta["ladder_us"])} | set(dark_ladder_us(plan, self.dev.min_us, self.dev.max_us)))
         widened = lad != [int(u) for u in meta["ladder_us"]]
         meta.update(ladder_us=lad, dark_ladder_us=dl, backoff=_backoff_meta(plan, self.lv))
-        if str(info.get("serial")) != str(meta.get("device", {}).get("serial")):
-            self.emit("error", text=f"resume: device serial {info.get('serial')} differs from the run's {meta['device'].get('serial')}")
         attrs = dict(app=meta["app"], serial=info.get("serial", ""), model=info.get("model", ""), label=plan.label,
                      notes=plan.notes, geometry=plan.geometry, edc=str(info.get("electric_dark_correction")),
                      nlc=str(info.get("nonlinearity_correction")), format_version=FORMAT_VERSION,
@@ -644,13 +658,13 @@ class Engine(threading.Thread):
         self.ctx["events"].defer = w.defer
         meta.setdefault("resumes", []).append(dict(segment=seg, resumed_local=iso_local(wall_ns()), previous_phase=st.get("phase"),
                                                    previous_status=st.get("status"), last_slot_local=st.get("last_slot_local"),
-                                                   gap_since_last_slot_s=gap_s, app=f"LightKeeper {VERSION}"))
-        (run_dir / "run_metadata.json").write_text(json.dumps(meta, indent=1, default=str))
+                                                   gap_since_last_slot_s=gap_s, source=source, app=f"LightKeeper {VERSION}"))
+        write_json_atomic(run_dir / "run_metadata.json", meta)
         self.auto = plan.auto_exposure
         self.backoff = _backoff_meta(plan, self.lv) is not None; self.low_count = 0
         self.emit("run", dir=str(run_dir), plan=plan.to_dict(), ladder_us=lad, t_start=t_start.isoformat(), t_stop=t_stop.isoformat(),
                   resumed=True, segment=seg)
-        self.log("resumed", f"segment {seg}; previous phase {st.get('phase')} ({st.get('status')}); last slot {st.get('last_slot_local')}"
+        self.log("resumed", f"segment {seg}; source {source}; previous phase {st.get('phase')} ({st.get('status')}); last slot {st.get('last_slot_local')}"
                             + (f"; gap {gap_s:.0f} s" if gap_s is not None else ""))
         for r in repairs:
             self.log("storage_repair", r)
@@ -985,8 +999,19 @@ class Engine(threading.Thread):
         c["meta"].update(final_local=iso_local(wall_ns()), finalize_reason=why, files=c["writer"].files,
                          rows=c["writer"].rows, dark_sessions=c["dark_session"])
         (c["dir"] / "run_metadata.json").write_text(json.dumps(c["meta"], indent=1, default=str))
+        self._save_state(status="closed")
+        self._close_writer()
+        figures = {}
+        try:
+            from .runplots import export_run_figures
+
+            figures = export_run_figures(c["dir"], c["meta"])
+        except Exception as e:
+            self.log("run_figures_failed", repr(e))
         try:                                     # one file that answers "was this a good run?"; never fatal
             summ = runview.summarize(c["dir"], c["meta"])
+            if figures:
+                summ["spectrograms"] = figures
             write_json_atomic(c["dir"] / "run_summary.json", summ)
             self.log("run_summary", f"usable {summ.get('usable_light', {}).get('first_local', '-')} to "
                                     f"{summ.get('usable_light', {}).get('last_local', '-')}, {summ['slots']['recorded']} slots, "
@@ -994,8 +1019,6 @@ class Engine(threading.Thread):
         except Exception as e:
             self.log("run_summary_failed", repr(e))
         self.log("run_closed", why)
-        self._save_state(status="closed")
-        self._close_writer()
         self.emit("run_closed", dir=str(c["dir"]), rows=c["writer"].snapshot()[0])
         self.ctx = None
         prevent_sleep(False)

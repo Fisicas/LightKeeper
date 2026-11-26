@@ -6,7 +6,7 @@ the vendor SDK) restarts the recorder with --resume after a back-off, as long as
 More than MAX_CRASHES crashes within CRASH_WINDOW_S stops the restarts (the run stays open and can be resumed by hand).
 
   LightKeeper.py --supervisor --plan <plan.json> --serial <serial> [--device-id N]
-  LightKeeper.py --supervisor --resume <run folder>          (also what the Windows logon entry runs)
+  LightKeeper.py --supervisor --resume <run folder>
 """
 from __future__ import annotations
 
@@ -17,8 +17,9 @@ import sys
 import time
 from pathlib import Path
 
-from .procs import (EXIT_DONE, EXIT_INTERRUPTED, EXIT_NO_DEVICE, EXIT_REFUSED, IS_WIN, app_home, entry_args, pid_alive,
-                    read_json, session_path, set_logon_resume, supervisor_lock, watchdog_clear, watchdog_off, write_json_atomic)
+from .procs import (EXIT_DONE, EXIT_INTERRUPTED, EXIT_NO_DEVICE, EXIT_REFUSED, IS_WIN, WATCHDOG_RESTART_PHASES,
+                    app_home, entry_args, pid_alive, read_json, remove_legacy_logon_entries, session_path,
+                    supervisor_lock, watchdog_candidates, watchdog_clear, watchdog_off, write_json_atomic)
 
 BACKOFF_S = [5, 10, 20, 40, 60]
 MAX_CRASHES, CRASH_WINDOW_S = 6, 600
@@ -38,19 +39,30 @@ def main(argv=None) -> int:
 
     say("supervisor start", argv)
     run_dir = Path(_arg(argv, "--resume")) if "--resume" in argv else None
+    source = _arg(argv, "--resume-source") or "manual"
     serial = _arg(argv, "--serial")
+    if "--registration-id" in argv:
+        index = argv.index("--registration-id")
+        registration = argv[index + 1]
+        del argv[index:index + 2]
+        # Re-resolve the data volume before writing any supervisor files.
+        match = next((r for r in watchdog_candidates() if r["registration_id"] == registration
+                      and r["resume_source"] == source), None)
+        if not match or run_dir is None:
+            say("registered run is no longer available for recovery"); return EXIT_REFUSED
+        run_dir = Path(match["run_dir"])
+        argv[argv.index("--resume") + 1] = str(run_dir)
     if run_dir is not None:
+        remove_legacy_logon_entries(run_dir)
         st = read_json(run_dir / "run_state.json")
         if not st or st.get("status") == "closed":
-            if st:                                       # a closed run needs no logon entry, however one was left behind
-                say(set_logon_resume(run_dir, False))
             say("run closed or unknown; nothing to do"); return EXIT_REFUSED
         serial = serial or st.get("serial", "")
         sup = read_json(run_dir / "supervisor.json")
-        if sup and pid_alive(sup.get("pid")) and int(sup["pid"]) != os.getpid():
+        if sup and pid_alive(sup.get("pid"), started=sup.get("started")) and int(sup["pid"]) != os.getpid():
             say(f"another supervisor (pid {sup['pid']}) already looks after this run"); return EXIT_REFUSED
         sess = read_json(session_path(serial))
-        if sess and pid_alive(sess.get("pid")):
+        if sess and pid_alive(sess.get("pid"), started=sess.get("started")):
             say(f"a recorder (pid {sess['pid']}) already holds {serial}"); return EXIT_REFUSED
     for attempt in range(6 if run_dir is None else 1):   # a new run may start just as the last run's supervisor is ending
         if supervisor_lock(serial):
@@ -59,7 +71,19 @@ def main(argv=None) -> int:
     else:
         say(f"another supervisor already looks after {serial}"); return EXIT_REFUSED
     if run_dir is not None:
-        watchdog_clear(run_dir)                          # a resume by hand or by the logon entry switches the watchdog back on
+        if source == "manual":
+            watchdog_clear(run_dir)
+        else:
+            st = read_json(run_dir / "run_state.json") or {}
+            if st.get("status") != "open" or (run_dir / "watchdog_off.json").exists():
+                say("automatic resume is no longer scheduled"); return EXIT_REFUSED
+            if source == "windows_restart":
+                try:
+                    stop = dt.datetime.fromisoformat(st["planned_stop_local"])
+                except (KeyError, TypeError, ValueError):
+                    say("the scheduled stop time is missing or invalid"); return EXIT_REFUSED
+                if st.get("phase") not in WATCHDOG_RESTART_PHASES or dt.datetime.now(stop.tzinfo) >= stop:
+                    say("run is no longer awaiting acquisition after a Windows restart"); return EXIT_REFUSED
     env = dict(os.environ, LIGHTKEEPER_SUPERVISOR_PID=str(os.getpid()))
     child_args = [a for a in argv]
     crashes: list[float] = []
@@ -91,7 +115,7 @@ def main(argv=None) -> int:
         wait = BACKOFF_S[min(k, len(BACKOFF_S) - 1)]; k += 1
         say(f"recorder crashed; resuming {run_dir} in {wait} s")
         time.sleep(wait)
-        child_args = ["--resume", str(run_dir)]
+        child_args = ["--resume-source", "supervisor_restart", "--resume", str(run_dir)]
     if run_dir is not None:
         sup = read_json(run_dir / "supervisor.json")
         if sup and int(sup.get("pid", -1)) == os.getpid():

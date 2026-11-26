@@ -33,7 +33,7 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
   - A supervisor restarts a crashed recorder and resumes the run as a new segment.
   - A watchdog resumes the run if the recorder and supervisor die together.
   - USB faults reopen the spectrometer by serial number.
-  - After a Windows restart, an open run resumes at logon.
+  - After Windows sign-in, an interrupted, opted-in run resumes from its journal if it was recording or armed and its scheduled stop has yet to pass. LightKeeper opens the window once the run is ready. Idle sessions leave no startup entry.
   - Closing the window never stops a run.
 - **Honest timing.** All stored times are UTC nanoseconds. An SNTP clock check runs at Start, hourly and at Stop, and the
   offset is saved with the data.
@@ -42,7 +42,8 @@ at a forest edge, with the vegetation red edge near 700 nm and both branches of 
 - **Temperature, where the hardware has it.** Spectrometers with a readable detector thermistor log a temperature with
   every slot. The Maya2000 Pro has none, and the run says so.
 - **A summary of every run.** `run_summary.json` lists integration changes, bursts, dark agreement, usable light and
-  clock offsets, and the Start dialog runs a pre-flight checklist.
+  clock offsets, and the Start dialog runs a pre-flight checklist. The run folder also gets raw-count and log-count-rate
+  spectrograms and a run overview with intensity, ratios, exposure, saturation, and gaps at close.
 - **Setup metadata.** The fiber, diffuser, view azimuth and elevation, window state, site altitude and a setup photo are
   stored with each run.
 
@@ -97,7 +98,11 @@ You need:
 | Python | `LIGHTKEEPER_PYTHON` | first `pythonw.exe` on PATH |
 | Open the spectrometer on start | `LIGHTKEEPER_AUTOCONNECT` (`0` = off) | on |
 
-The window remembers the last run folder and site you used.
+The window remembers the last run folder and site you used. Windows drive identity lets it find the folder after a drive letter changes.
+
+If your Start menu shortcut uses an update wrapper, it can fast-forward the installed Git checkout before opening LightKeeper.
+Close any idle window before reopening it so the new version starts. `Launch_LightKeeper.cmd` opens the files in its own folder.
+For a direct Git checkout that follows `origin/main`, run `git pull --ff-only` while LightKeeper and its recorder are idle.
 
 ## Documentation
 

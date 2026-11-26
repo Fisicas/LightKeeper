@@ -42,6 +42,7 @@ w.engine.send("connect", SIM_ID, True, True); pump(5, lambda: w.state == "IDLE")
 w.exp_mode.setCurrentIndex(1); w.int_spin.setValue(100); w._toggle_preview(); pump(2)
 w.max_spin.setValue(200); w.btn_dark.click(); pump(15, lambda: w.hot is not None and w.state == "PREVIEW"); pump(1)
 w.cb_dark.setChecked(True); pump(0.5)
+(HOME / "spectra").mkdir()                                   # an existing folder saved by the older version
 w.settings.setValue("spectra_dir", str(HOME / "spectra"))     # never the real Documents folder
 w.label_edit.setText("Hg Ar lamp"); w.btn_save_spec.click()
 w.label_edit.setText(""); w.btn_save_spec.click(); w.btn_save_spec.click()

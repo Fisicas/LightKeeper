@@ -1,7 +1,7 @@
 """LightKeeper entry point.  pythonw -X utf8 LightKeeper.py
 
   LightKeeper.py                       the window (attaches to a running background recorder if there is one)
-  LightKeeper.py --supervisor ...      background: keeps a run's recorder alive (started by the window / at logon)
+  LightKeeper.py --supervisor ...      background: keeps a run's recorder alive (started by the window or watchdog)
   LightKeeper.py --recorder ...        background: the recorder itself (started by the supervisor)
   LightKeeper.py --watchdog            background: one check that an open run is alive (started by a scheduled task)
   LightKeeper.py --fetch-weather <run folder> ...   public weather for recorded runs, written beside them
@@ -24,5 +24,7 @@ if __name__ == "__main__":
     if "--fetch-weather" in sys.argv:
         from lightkeeper.weather import main as wx_main
         raise SystemExit(wx_main([a for a in sys.argv[1:] if a != "--fetch-weather"]))
+    from lightkeeper.procs import remove_legacy_logon_entries
     from lightkeeper.splash import main       # shows the splash first, then loads the window
+    remove_legacy_logon_entries()
     raise SystemExit(main())

@@ -27,9 +27,14 @@ scan per update), as OceanView does. Spectrometers plugged in later are picked u
 | Metric strip | Slots recorded, integration time, scans per slot, peak counts, saturated slots, bursts, dark sets and data written. On the right: the next event (start countdown, next burst, stop) and the background recorder it is attached to. |
 | Setup panel | Spectrometer; Live view (with **Take dark set…**); Run (label, geometry, notes, folder); Schedule; Acquisition (time slot, integration range, bursts, dark sets). **Show advanced settings** opens the ladder, dark time per integration time, SD storage, site and restart resume. |
 | Time range (Waterfall, Time series) | **Usable daylight (auto)** draws only where the 420–700 nm dark-corrected signal stays above 1 % of the day's bright level for 5 min; **All data** or **Custom** from/to; **Reset** returns to auto. The range drawn is quoted next to it. **Open recorded run…** shows a finished run read-only, dark-corrected with its pre-run dark set. |
-| Spectrum tab | **Save spectrum** (Ctrl+S) writes the scan on screen as a two-column `.dpt` (wavelength nm, signal; `#` header lines with the main details, which OPUS skips) plus a `.json` with everything, in `<Save in>\..\spectra\`, named `<label>_<date>_<time>` or just the time. **Live scan:** counts or counts/s, the matched dark and the saturation line. **Wavelength strip:** each wavelength in its colour, fading into the UV and the NIR. **Recent slots:** the last 24, newest brightest. The toolbar has navigation, Auto-scale, **Fit y** and **Display** (dark subtraction, counts/s, log y, hide hot/cold pixels, calibrated axis). |
+| Spectrum tab | **Save spectrum** (Ctrl+S) writes a two-column `.dpt` (wavelength nm and signal) plus a `.json` with the details. **Repeat save…** saves a set number of fresh live scans at a minimum interval. The toolbar includes Auto-scale, **Fit y** within the current wavelength range, **Fit X/Y** to restore the display range and fit both axes, and **Display → Show all detector channels** to include terminal channels. Exports include every detector channel. |
 | Waterfall | Recorded spectra over time: spectral shape normalised at 780–820 nm, log₁₀ counts/s, ratio to the first slot, or **Raw counts, as recorded** (mean counts per scan as stored: no dark subtraction, no scaling to a wavelength or to integration time, so a change of integration time shows as a step). **Cursor** reads the wavelength, time and value at a click. |
-| Time series | Band-integrated signal, integration time and saturation over the run. |
+| Time series | The default panels show the mean 420–700 nm count rate, narrow R:FR, B:G, and integration time with scan and saturation markers. The other ratios are optional. |
+
+R:FR uses detector-channel means in 655–665 nm and 725–735 nm. B:G uses wavelength-bin overlap integrals in 420–490 nm
+and 500–570 nm. Far-red share uses 700–750 nm over 400–750 nm. The two broad-band traces require a matching dark, at least
+90% valid band coverage, and a slot without saturation. The ratios describe instrument counts. Comparing them to photon
+ratios requires spectral-response calibration for the full optical setup.
 | Schedule tab | The plan as a table, plus the sun times, beside the solar-elevation plot. |
 | Calibration tab | Lamp wavelength calibration (see below). |
 | Log tab | The run's event journal. |
@@ -109,6 +114,15 @@ analysis between the two sets, using the UV floor (205–290 nm) as a tracer.
 - **`run_summary.json`** (written when the run closes): slots and saturated slots, each integration change with its time,
   bursts with their integration and realised scan rate, dark times and pre/post dark agreement, the usable-light window
   with the sun elevation at each end, the clock-offset range, the temperature range and the version.
+- **`spectrogram_raw_counts.png`** uses the stored slot-mean counts on a linear color scale and includes all detector channels.
+  **`spectrogram_log10_counts_per_s.png`** divides by each slot's integration time and uses exposure-matched darks when available.
+  The log view omits documented terminal channels. Its darkest color covers values at or below a display floor of five matched
+  single-scan dark standard deviations or twice the pre/post dark difference, whichever is larger for that channel. If the run
+  has no dark set, the log view labels its uncorrected rates and uses one color for nonpositive values. Both figures decimate
+  slots for display and leave recording gaps blank.
+- **`run_qc_overview.png`** aligns the visible count rate, spectral ratios, integration time, saturated-scan markers, and
+  acquisition gaps on one local-time axis. Use it with the two spectrograms to distinguish changes in the light from changes
+  in the acquisition.
 - **`events.csv`:** a journal of every event, with UTC nanoseconds and local time.
 - **`spectra_YYYYMMDD_HHMM.h5`:** files rotate hourly. Each holds `wavelength_nm_device` and three groups:
   - **`blocks`**: one row per slot. Fields: `t_wall_ns`, `t_start_wall_ns`, `t_end_wall_ns`, `slot_index`, `segment` (0.2.0), `int_us`,
@@ -228,6 +242,8 @@ the source and are not comparable between species; they are used only to select 
 
 **What is copied:** when the window opens, and when a run closes, the setup panel is filled from the newest run in **Save in**: label, geometry, notes, diffuser, fiber, view, site, schedule choices, acquisition settings and switches. The panel says so, and its tooltip names the run. Everything can still be edited.
 
+LightKeeper remembers **Save in**, previously loaded setups, the last folder opened for review and unfinished runs by Windows volume identity and the path within that volume. If Windows reassigns a drive letter, LightKeeper looks up the volume's current mount point. When the saved data drive is disconnected, reconnect it or choose another folder in **Save in** before starting a run. LightKeeper can identify an older drive-letter setting when its saved path is accessible during migration. If a drive already moved before the update, browse to its correct folder once.
+
 **What changes by itself:**
 - **Dates and times:** sun events are worked out for the next day. A set time keeps its clock time and moves to its next occurrence.
 - **Label:** one ending in `day N` counts up, so `canopy day 2` becomes `canopy day 3`. Any other label stays, and the run folder gets its own date and version.
@@ -307,10 +323,11 @@ as GammaKeeper's independent recorder).
   To end a run on purpose, use **Stop** or **Interrupt**: killing both processes in Task Manager brings the run back.
   What it did is in `logs\watchdog_<date>.log`.
 - **USB fault.** After 3 and 5 failed scans the spectrometer is closed and reopened by serial number.
-- **Windows restart.** While a run is open, a per-run entry `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\LightKeeperResume_<run>`
-  restarts the supervisor with `--resume` at the next **logon**. Nothing runs before you log in. The entry is removed
-  when the run closes or is interrupted on purpose. It can be switched off per run with "resume automatically after a
-  Windows restart".
+- **Windows restart.** The run's watchdog checks again at **sign-in**. It resumes an armed or collecting run
+  with **Resume after a Windows restart** enabled if the scheduled stop has yet to pass. It waits for the
+  original data volume and spectrometer, then opens the LightKeeper window once the run is armed or collecting
+  again. Windows requires a sign-in before this recovery can run. The scheduled task is removed when no run
+  needs it. LightKeeper leaves no Windows Startup Apps entry.
 - **Interrupt, resume later** (tray or window). Acquisition stops and everything is flushed. The spectrometer is
   released, and `run_state.json` says `interrupted`. The window offers to resume unfinished runs when it opens, and
   **Resume an unfinished run…** does it by hand.
@@ -330,7 +347,7 @@ New or changed files in a run folder:
 - `run_state.json`: the run journal (status `open` / `interrupted` / `closed`, phase, segment, last slot, counts,
   dark sets, files), rewritten atomically at every state change and every flush.
 - `supervisor.json`: present while a supervisor looks after the run.
-- `watchdog_off.json`: the watchdog leaves this run alone, and why. The next resume by hand or at logon removes it.
+- `watchdog_off.json`: the watchdog leaves this run alone, and why. The next manual resume clears it.
 - `blocks/segment` (int16): 0 for the first stretch of recording, +1 for each resume. `slot_index` restarts in each
   segment; `t_wall_ns` is the time base.
 
@@ -350,6 +367,8 @@ Process files: `%LOCALAPPDATA%\LightKeeper\`, holding:
 - **Auto-scale** fits the y-axis to the data, not to the saturation line.
 - **Mouse wheel** stretches y about the cursor; **Shift+wheel** zooms x; **Ctrl+wheel** zooms both.
 - **Fit y** fits both panels to the data in the visible wavelength range.
+- **Fit X/Y** restores the display wavelength range and scales both spectrum panels to their data. **Show all detector channels**
+  includes terminal channels for inspection.
 - **Double-click** resets.
 - Any wheel or toolbar zoom unticks Auto-scale, so the view is held while the data update. The toolbar's pan tool with
   the right mouse button drag also stretches the axes.

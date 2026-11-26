@@ -36,8 +36,8 @@ from .engine import Engine
 from .icons import state_icon
 from .link import RUN_COMMANDS
 from .procs import (EXIT_DONE, EXIT_INTERRUPTED, EXIT_NO_DEVICE, EXIT_REFUSED, app_home, entry_args, pid_alive, read_json,
-                    register_open_run, session_path, set_logon_resume, set_watchdog_task, spawn_detached, sync_watchdog,
-                    unregister_open_run, write_json_atomic)
+                    register_open_run, remove_legacy_logon_entries, session_path, set_watchdog_task, spawn_detached,
+                    sync_watchdog, unregister_open_run, windows_boot_id, windows_boot_time, write_json_atomic)
 from .schedule import RunPlan
 from .storage import LOCAL_TZ
 
@@ -185,12 +185,16 @@ class Recorder(QtCore.QObject):
         self.args = args
         self.exit_code = None
         self.plan = None; self.run_dir = Path(args.resume) if args.resume else None
+        self._registration = None
+        self._recovery_stop = None
         if args.resume:
             meta = read_json(self.run_dir / "run_metadata.json") or {}
             st = read_json(self.run_dir / "run_state.json") or {}
             self.plan = RunPlan.from_dict(meta.get("plan", {}))
             self.serial = args.serial or st.get("serial") or meta.get("device", {}).get("serial", "")
             self.run_status = st.get("status")
+            if args.resume_source == "windows_restart":
+                self._recovery_stop = dt.datetime.fromisoformat(st["planned_stop_local"])
         else:
             self.plan = RunPlan.from_dict(read_json(Path(args.plan)) or {})
             self.serial = args.serial
@@ -202,6 +206,7 @@ class Recorder(QtCore.QObject):
         self.logs = collections.deque(maxlen=500)
         self.last_slot = None; self._last_scan_tx = 0.0; self._last_err_note = 0.0; self._start_sent = False
         self._run_requested = False   # 0.3.2: start/resume sent; never reconnect after this
+        self._show_recovered_run = args.resume_source == "windows_restart"
         self._connect_deadline = time.time() + 60; self._next_connect = 0.0; self._connecting = False
         self.engine = Engine()
         self.hub = Hub(self._command, self._snapshot)
@@ -319,6 +324,11 @@ class Recorder(QtCore.QObject):
     def _tick(self):
         if self._connecting is False and self.state == "WAITING_DEVICE" and self.device is None and not self._run_requested \
                 and time.time() >= self._next_connect:
+            stop = self._recovery_stop
+            if stop and dt.datetime.now(stop.tzinfo) >= stop:
+                print("Scheduled stop passed while waiting for the spectrometer", flush=True)
+                self._exit(EXIT_REFUSED)
+                return
             self._try_connect()
         if self.state in ("RECORDING", "BURST", "STANDBY"):
             self._refresh_tray()
@@ -394,7 +404,7 @@ class Recorder(QtCore.QObject):
             print(f"device: {e['info']}", flush=True)
             self._run_requested = True
             if self.args.resume:
-                self.engine.send("resume", str(self.run_dir))
+                self.engine.send("resume", str(self.run_dir), self.args.resume_source)
             elif self.run is None:
                 self.engine.send("start", self.plan.to_dict()); self._start_sent = True
             return True
@@ -416,6 +426,12 @@ class Recorder(QtCore.QObject):
                 s = "WAITING_DEVICE"; e = dict(e, state=s)
             prev = self.state
             self._set_state(s, e.get("detail", ""))
+            if self._show_recovered_run and s in ("RECORDING", "BURST", "STANDBY") and self.run:
+                self._show_recovered_run = False
+                try:
+                    spawn_detached(entry_args(), app_home() / "logs" / "launch_recovered_run.log")
+                except OSError as exc:
+                    print(f"Could not open LightKeeper after resuming the run: {exc}", flush=True)
             if s == "RECORDING" and prev not in ("RECORDING", "BURST"):
                 self._note("Recording", f"{self.run_dir.name if self.run_dir else ''}\nRecording until "
                                         f"{dt.datetime.fromisoformat(self.run['t_stop']):%a %H:%M}." if self.run else "Recording started.")
@@ -435,10 +451,11 @@ class Recorder(QtCore.QObject):
             self.run = dict(dir=e["dir"], plan=e["plan"], ladder_us=e["ladder_us"], t_start=e["t_start"], t_stop=e["t_stop"],
                             resumed=e.get("resumed", False), segment=e.get("segment", 0))
             self.run_dir = Path(e["dir"]); self._write_session()
-            register_open_run(self.run_dir, self.serial)
             plan = RunPlan.from_dict(e["plan"])
-            note = set_logon_resume(self.run_dir, bool(getattr(plan, "auto_resume_logon", True)))
-            print(note, flush=True); self.logs.append(note)
+            self._registration = register_open_run(self.run_dir, self.serial, recovery=dict(
+                auto_resume_logon=plan.auto_resume_logon, boot_id=windows_boot_id(), boot_time=windows_boot_time(),
+                planned_stop_local=e["t_stop"]))
+            remove_legacy_logon_entries(self.run_dir)
             note = set_watchdog_task(True)
             print(note, flush=True); self.logs.append(note)
             if e.get("resumed"):
@@ -447,10 +464,8 @@ class Recorder(QtCore.QObject):
             return True
         if t in ("run_closed", "run_interrupted"):
             closed = t == "run_closed"
-            if self.run_dir:
-                set_logon_resume(self.run_dir, False)
-                if closed:
-                    unregister_open_run(self.run_dir)
+            if self.run_dir and closed:
+                unregister_open_run(self.run_dir, registration=self._registration)
             print(sync_watchdog(), flush=True)
             self._note("Run closed" if closed else "Run interrupted",
                        f"{self.run_dir.name if self.run_dir else ''}\n" + ("All data saved; spectrometer released." if closed else
@@ -492,6 +507,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="LightKeeper --recorder")
     ap.add_argument("--plan"); ap.add_argument("--resume"); ap.add_argument("--serial", default="")
     ap.add_argument("--device-id", type=int, default=None)
+    ap.add_argument("--resume-source", default="manual",
+                    choices=("manual", "watchdog", "windows_restart", "supervisor_restart"))
     args = ap.parse_args(argv)
     if bool(args.plan) == bool(args.resume):
         print("give exactly one of --plan or --resume"); return EXIT_REFUSED
@@ -507,7 +524,7 @@ def main(argv=None) -> int:
             print("nothing to resume:", st and st.get("status")); return EXIT_REFUSED
     serial = args.serial or (read_json(Path(args.resume) / "run_state.json") or {}).get("serial", "") if args.resume else args.serial
     other = read_json(session_path(serial))
-    if other and pid_alive(other.get("pid")) and int(other["pid"]) != os.getpid():
+    if other and pid_alive(other.get("pid"), started=other.get("started")) and int(other["pid"]) != os.getpid():
         print(f"another recorder (pid {other['pid']}) holds {serial}; refusing"); return EXIT_REFUSED
     try:
         import ctypes

@@ -11,6 +11,7 @@ crashing, never stops a run. Live view and calibration still use the window's ow
 from __future__ import annotations
 
 import datetime as dt
+import importlib.util
 import json
 import os
 import sys
@@ -36,14 +37,15 @@ from . import clock  # noqa: E402
 from .engine import SAT_LEVEL, Engine  # noqa: E402
 from .icons import ICON_SVG, icon  # noqa: E402,F401
 from .link import RecorderLink  # noqa: E402
-from .procs import (app_home, entry_args, live_sessions, needs_watching, open_runs, read_json, set_window_holds, spawn_detached,  # noqa: E402
+from .locations import location_key, remember_path, resolve_path  # noqa: E402
+from .procs import (app_home, entry_args, gui_python, live_sessions, needs_watching, open_runs, read_json, set_window_holds, spawn_detached,  # noqa: E402
                     supervisor_alive, watched_runs, watchdog_off,  # noqa: E402
                     write_json_atomic)
 from .schedule import (SETUP_FIELDS, DEFAULT_LADDER_MS, DEFAULT_OUT_DIR, DEFAULT_SITE, SUN_EVENTS, RunPlan, estimates, next_clock_time, old_acquisition_defaults,  # noqa: E402
                        next_label, old_default_times, solar_day, sun_events)
 from .storage import LOCAL_TZ, local_dt  # noqa: E402
 
-from . import hotpix, runview, theme, weather  # noqa: E402
+from . import display, hotpix, runview, theme, weather  # noqa: E402
 from .theme import BLUE, GREEN, LAMP, LINE, ORANGE, RED, SURFACE, TEXT, TEXT2, TEXT3, VIOLET  # noqa: E402
 
 # legacy colour names used by the drawing code, mapped onto the theme tokens
@@ -314,6 +316,9 @@ class Window(Q.QMainWindow):
         self.slots = []; self.spectra = []; self.spec_stride = 1; self._slot_count = 0; self._dirty_ts = False
         self.run_dir = None; self.plan = None; self.run_plan = None; self.run_times = None; self.cal = {}; self.cal_result = None; self.n_bursts = 0; self._last_ts_draw = 0.0
         self._dialog = False; self._last_live = 0; self._scan_new = False
+        self._edge_layout = None
+        self._repeat_save = None
+        self._setup_scrolled = 0.0
         self._scrub_t = None; self._usable_cache = (None, 0); self._recent_shown = None; self._wf_shown = None
         self._applying_setup = False; self._setup_from = None; self._wx_log = []
         self.viewing = None; self._load = None; self.link = None; self._expect_attach = None; self._closed_run = False; self._a1_ylim = None; self._last_attach_try = 0.0
@@ -402,7 +407,8 @@ class Window(Q.QMainWindow):
             Q.QMessageBox.information(self, APP_NAME, "A run is being recorded or watched. Open a recorded run when it has finished."); return
         if self._load is not None:
             return
-        d = Q.QFileDialog.getExistingDirectory(self, "Recorded run folder (contains spectra_*.h5)", self.out_edit.text())
+        d = Q.QFileDialog.getExistingDirectory(self, "Recorded run folder (contains spectra_*.h5)",
+                                               self._stored_location("recorded_run_dir") or self._output_dir())
         if not d:
             return
         if not list(Path(d).glob("spectra_*.h5")):
@@ -412,10 +418,9 @@ class Window(Q.QMainWindow):
     def _start_load(self, d):
         """Read the run in a worker thread (the files are opened read-only); _poll_load() picks up the result."""
         self._load = dict(dir=d, frac=0.0, result=None)
-        valid = self.valid if self.valid is not None and not self.valid.all() else None
         def work(job=self._load):
             try:
-                job["result"] = runview.load_run(job["dir"], valid=valid, progress=lambda f: job.__setitem__("frac", f))
+                job["result"] = runview.load_run(job["dir"], progress=lambda f: job.__setitem__("frac", f))
             except Exception as e:
                 job["result"] = e
         threading.Thread(target=work, daemon=True, name="LightKeeperRunLoad").start()
@@ -431,6 +436,7 @@ class Window(Q.QMainWindow):
         self._load_timer.stop(); self._load = None; self.progress.setVisible(False)
         if isinstance(r, Exception):
             Q.QMessageBox.warning(self, APP_NAME, f"Could not read the run:\n{r!r}"); return
+        self._remember_location("recorded_run_dir", r["dir"])
         self.slots = r["slots"]; self.spectra = list(r["spectra"]); self.spec_stride = r["stride"]; self._slot_count = len(self.slots)
         if self.axis is None or len(self.axis) != len(r["wl"]):
             self.axis = np.asarray(r["wl"]).copy(); self.wl_dev = self.axis.copy() if self.wl_dev is None else self.wl_dev
@@ -523,6 +529,7 @@ class Window(Q.QMainWindow):
         m.addAction("Resume an unfinished run…", self._resume_dialog)
         m.addAction("Open a recorded run (read-only)…", self._open_recorded_run)
         m.addAction("Fetch weather for a run…", self._weather_dialog)
+        m.addAction("Open CzernyScope…", self._open_spectrometer_live)
         self.a_close_rec = m.addAction("Close the recorded run", self._close_recorded_run); self.a_close_rec.setEnabled(False)
         m.addSeparator()
         m.addAction("Open log folder", lambda: os.startfile(str(app_home() / "logs")))
@@ -544,12 +551,72 @@ class Window(Q.QMainWindow):
         nv.addWidget(self.next_lbl); nv.addWidget(self.link_lbl); row.addLayout(nv)
         return f
 
+    def _open_spectrometer_live(self):
+        if self._spectrometer_live_open():
+            self.statusBar().showMessage("CzernyScope is already open.", 10000)
+            return
+        if self.link is not None or self._expect_attach is not None or live_sessions() or watched_runs():
+            Q.QMessageBox.information(self, APP_NAME, "CzernyScope needs the USB instrument. "
+                                      "Wait for LightKeeper recordings to finish before opening it.")
+            return
+        if self.state != "DISCONNECTED" or self.engine.state != "DISCONNECTED" or self._pending_connect:
+            Q.QMessageBox.information(self, APP_NAME, "Disconnect the spectrometer in LightKeeper first.")
+            return
+
+        source = None
+        configured = os.environ.get("SPECTROMETER_LIVE_SOURCE") or self.settings.value("spectrometer_live_source", "", type=str)
+        if importlib.util.find_spec("spectrometer_app") is None:
+            project = Path(configured) if configured else None
+            if project is None or not (project / "spectrometer_app" / "__main__.py").is_file():
+                folder = Q.QFileDialog.getExistingDirectory(
+                    self, "Choose the CzernyScope project folder", configured
+                )
+                if not folder:
+                    return
+                project = Path(folder)
+            source = next((p for p in (project, project / "src")
+                           if (p / "spectrometer_app" / "__main__.py").is_file()), None)
+            if source is None:
+                Q.QMessageBox.warning(self, APP_NAME, "Choose the folder containing the CzernyScope application.")
+                return
+
+        try:
+            log = app_home() / "logs" / "spectrometer_live.log"
+            process = spawn_detached(
+                [gui_python(), "-X", "utf8", "-m", "spectrometer_app"], log, working_dir=source
+            )
+        except OSError as error:
+            Q.QMessageBox.warning(self, APP_NAME, f"Could not open CzernyScope.\n\n{error}")
+            return
+        self._spectrometer_live = process
+        previous_auto = self._auto
+        self._auto = False
+        if source is not None:
+            self.settings.setValue("spectrometer_live_source", str(source))
+        self.statusBar().showMessage("Opened CzernyScope.", 10000)
+
+        def check_start():
+            code = process.poll()
+            if self._spectrometer_live is process and code is not None and code != 0:
+                self._auto = previous_auto
+                Q.QMessageBox.warning(self, APP_NAME,
+                                      f"CzernyScope exited during startup (code {code}).\n\nLog: {log}")
+
+        QtCore.QTimer.singleShot(1500, self, check_start)
+
+    def _spectrometer_live_open(self):
+        process = getattr(self, "_spectrometer_live", None)
+        return process is not None and process.poll() is None
+
     def _left(self):
         frame = Q.QFrame(); frame.setObjectName("setup"); frame.setFixedWidth(SETUP_MIN_W)
         fv = Q.QVBoxLayout(frame); fv.setContentsMargins(0, 0, 0, 0); fv.setSpacing(0)
         sc = Q.QScrollArea(); sc.setWidgetResizable(True); sc.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        # the scroll bar is hidden, but Tab would still scroll sideways to show a focused box, with no way back
-        hbar = sc.horizontalScrollBar(); hbar.valueChanged.connect(lambda v: hbar.setValue(0) if v else None)
+        # Keep the viewport width constant as word-wrapped text and optional sections change height.
+        sc.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        sc.verticalScrollBar().setSingleStep(12)
+        sc.verticalScrollBar().valueChanged.connect(lambda _: setattr(self, "_setup_scrolled", time.monotonic()))
+        self.setup_scroll = sc
         w = Q.QWidget(); sc.setWidget(w); lay = Q.QVBoxLayout(w); lay.setContentsMargins(16, 8, 14, 12); lay.setSpacing(6)
         fv.addWidget(sc, 1)
 
@@ -607,8 +674,12 @@ class Window(Q.QMainWindow):
         b.clicked.connect(lambda: self.photo_edit.setText(Q.QFileDialog.getOpenFileName(
             self, "Setup photo", "", "Images (*.jpg *.jpeg *.png *.heic);;All files (*)")[0] or self.photo_edit.text()))
         f.addRow("Setup photo", hbox(self.photo_edit, b))
-        self.out_edit = Q.QLineEdit(str(self.settings.value("out_dir", DEFAULT_OUT_DIR))); b = Q.QPushButton("Browse…")
-        b.clicked.connect(lambda: self.out_edit.setText(Q.QFileDialog.getExistingDirectory(self, "Save runs in", self.out_edit.text()) or self.out_edit.text()))
+        self._out_location = self._location_record("out_dir", DEFAULT_OUT_DIR)
+        self._out_text = str(resolve_path(self._out_location) or "")
+        self.out_edit = Q.QLineEdit(self._out_text); b = Q.QPushButton("Browse…")
+        self.out_edit.setPlaceholderText("Reconnect the saved drive or choose a folder")
+        self.out_edit.editingFinished.connect(self._commit_output_location)
+        b.clicked.connect(self._browse_output_location)
         self.out_edit.textChanged.connect(lambda t: self.out_edit.setToolTip(t)); self.out_edit.setToolTip(self.out_edit.text())
         f.addRow("Save in", hbox(self.out_edit, b))
 
@@ -743,11 +814,69 @@ class Window(Q.QMainWindow):
         w.ensurePolished()
         need = w.minimumSizeHint().width() + sc.verticalScrollBar().sizeHint().width() + 2 * sc.frameWidth()
         frame.setFixedWidth(min(SETUP_MAX_W, max(SETUP_MIN_W, need)))
+        w.setSizePolicy(Q.QSizePolicy.Policy.Ignored, Q.QSizePolicy.Policy.Preferred)
         return frame
 
     def _sat(self) -> float:
         """Saturation level of the connected spectrometer (12-bit USB650: 3,749; 16-bit: 60,000)."""
         return float((self.info or {}).get("saturation_level_counts") or SAT_LEVEL)
+
+    def _store_location(self, key: str, record: dict):
+        self.settings.setValue(key + "_location", json.dumps(record))
+        self.settings.setValue(key, record["path"])
+
+    def _location_record(self, key: str, default: str = "") -> dict:
+        saved = self.settings.value(key + "_location", "", type=str)
+        if saved:
+            try:
+                record = json.loads(saved)
+                if isinstance(record, dict) and isinstance(record.get("path"), str):
+                    return record
+            except ValueError:
+                pass
+            return {"path": ""}
+        legacy = self.settings.value(key, default, type=str)
+        if legacy and (not self.settings.contains(key) or Path(legacy).exists()):
+            record = remember_path(legacy)
+            self._store_location(key, record)
+            return record
+        return {"path": legacy, "unverified_legacy_path": bool(legacy)}
+
+    def _remember_location(self, key: str, path: str | Path) -> dict:
+        record = remember_path(path)
+        self._store_location(key, record)
+        return record
+
+    def _stored_location(self, key: str, default: str = "") -> str:
+        record = self._location_record(key, default)
+        path = str(resolve_path(record) or "")
+        if path and path != record["path"]:
+            self._store_location(key, dict(record, path=path))
+        return path
+
+    def _output_dir(self) -> str:
+        text = self.out_edit.text()
+        if text != self._out_text:  # Leave partially typed text and its cursor alone.
+            return text.strip()
+        self._out_text = str(resolve_path(self._out_location) or "")
+        if self._out_text != text:
+            self.out_edit.setText(self._out_text)
+        if self._out_text and self._out_text != self._out_location["path"]:
+            self._out_location = dict(self._out_location, path=self._out_text)
+            self._store_location("out_dir", self._out_location)
+        return self._out_text
+
+    def _commit_output_location(self):
+        text = self.out_edit.text()
+        if text != self._out_text:
+            self._out_location = self._remember_location("out_dir", text.strip())
+            self._out_text = text
+
+    def _browse_output_location(self):
+        chosen = Q.QFileDialog.getExistingDirectory(self, "Save runs in", self._output_dir())
+        if chosen:
+            self.out_edit.setText(chosen)
+            self._commit_output_location()
 
     def _apply_previous_setup(self):
         """Fill the setup panel from the newest run in the Save in folder, so setting up a run takes one press of Start.
@@ -800,10 +929,25 @@ class Window(Q.QMainWindow):
         return True
 
     def _remember_setup_source(self, path: str):
-        rec = [x for x in (self.settings.value("setup_recent", []) or []) if x and x != path]
-        if isinstance(rec, str):
-            rec = [rec]
-        self.settings.setValue("setup_recent", [path] + list(rec)[:9])
+        record = remember_path(path)
+        key = location_key(record)
+        recent = [x for x in self._recent_setup_locations() if location_key(x) != key]
+        self.settings.setValue("setup_recent_locations", json.dumps([record, *recent[:9]]))
+
+    def _recent_setup_locations(self) -> list[dict]:
+        saved = self.settings.value("setup_recent_locations", "", type=str)
+        if saved:
+            try:
+                return [x for x in json.loads(saved) if isinstance(x, dict) and x.get("path")]
+            except (TypeError, ValueError):
+                return []
+        legacy = self.settings.value("setup_recent", []) or []
+        if isinstance(legacy, str):
+            legacy = [legacy]
+        recent = [remember_path(path) if Path(path).exists() else {"path": path} for path in legacy if path]
+        if recent:
+            self.settings.setValue("setup_recent_locations", json.dumps(recent))
+        return recent
 
     def _fill_setup_menu(self):
         """Recent runs in the Save in folder, setups loaded before, and Browse."""
@@ -817,20 +961,19 @@ class Window(Q.QMainWindow):
             dev = (meta.get("device") or {}).get("model", "")
             a = m.addAction(f"{meta['_folder']}   ({dev} {exp})".replace("  ( ", "  ("))
             a.triggered.connect(lambda _=False, d=meta["_dir"]: self._import_setup(d))
-        rec = self.settings.value("setup_recent", []) or []
-        rec = [rec] if isinstance(rec, str) else [x for x in rec if x and Path(x).exists()]
-        here = {str(meta["_dir"]) for meta in metas}
-        rec = [x for x in rec if x not in here and str(Path(x).parent) not in here]
+        here = {Path(meta["_dir"]) for meta in metas}
+        rec = [path for x in self._recent_setup_locations()
+               if (path := resolve_path(x)) and path.exists() and path not in here and path.parent not in here]
         if rec:
             m.addSection("Loaded before")
             for x in rec[:8]:
                 a = m.addAction(Path(x).parent.name if Path(x).name == "run_metadata.json" else Path(x).name)
-                a.setToolTip(x); a.triggered.connect(lambda _=False, x=x: self._import_setup(x))
+                a.setToolTip(str(x)); a.triggered.connect(lambda _=False, x=x: self._import_setup(x))
         m.addSeparator()
         m.addAction("Browse for run_metadata.json…", self._browse_setup)
 
     def _browse_setup(self):
-        fn, _ = Q.QFileDialog.getOpenFileName(self, "Load setup from a run", self.out_edit.text(),
+        fn, _ = Q.QFileDialog.getOpenFileName(self, "Load setup from a run", self._output_dir(),
                                               "Run settings (run_metadata.json *.json)")
         if fn:
             self._import_setup(fn)
@@ -950,8 +1093,11 @@ class Window(Q.QMainWindow):
         r.addWidget(self.cb_auto)
         self.btn_fity = Q.QPushButton("Fit y"); self.btn_fity.setToolTip("Stretch the y-axes to the data in the visible wavelength range")
         self.btn_fity.clicked.connect(self._fit_y_now); r.addWidget(self.btn_fity)
+        self.btn_fitxy = Q.QPushButton("Fit X/Y")
+        self.btn_fitxy.setToolTip("Restore the display wavelength range and fit both y-axes.")
+        self.btn_fitxy.clicked.connect(self._fit_xy_now); r.addWidget(self.btn_fitxy)
         self.btn_full = Q.QPushButton("Full scale")
-        self.btn_full.setToolTip("Whole wavelength range, counts from 0 to just above the detector's largest count (64,000 on a "
+        self.btn_full.setToolTip("Display wavelength range, counts from 0 to just above the detector's largest count (64,000 on a "
                                  "Maya2000 Pro, 4,095 on a USB650), so the saturation line is always in view. It stays at full "
                                  "scale until you zoom, press Fit y or tick Auto-scale.")
         self.btn_full.clicked.connect(self._full_scale); r.addWidget(self.btn_full)
@@ -959,9 +1105,11 @@ class Window(Q.QMainWindow):
         dm = Q.QMenu(disp)
         self.cb_dark = dm.addAction("Subtract the matched dark"); self.cb_rate = dm.addAction("Counts per second")
         self.cb_log = dm.addAction("Logarithmic y-axis"); self.cb_mask = dm.addAction("Hide hot and cold pixels")
+        self.cb_edges = dm.addAction("Show all detector channels")
         self.cb_cal = dm.addAction("Calibrated wavelength axis")
-        for a in (self.cb_dark, self.cb_rate, self.cb_log, self.cb_mask, self.cb_cal):
+        for a in (self.cb_dark, self.cb_rate, self.cb_log, self.cb_mask, self.cb_edges, self.cb_cal):
             a.setCheckable(True)
+        self.cb_edges.toggled.connect(self._fit_xy_now)
         self.cb_mask.setChecked(self.settings.value("hide_hot_pixels", True, type=bool)); self.cb_cal.setEnabled(False)
         self.cb_mask.toggled.connect(lambda on: (self.settings.setValue("hide_hot_pixels", on), self._draw_waterfall()))
         dm.addSeparator()
@@ -969,9 +1117,16 @@ class Window(Q.QMainWindow):
         hint2 = dm.addAction("Pointing at a plot shows the wavelength, pixel and counts there"); hint2.setEnabled(False)
         disp.setMenu(dm); r.addWidget(disp)
         self.btn_save_spec = Q.QPushButton("Save spectrum")
-        self.btn_save_spec.setToolTip("Save the scan on screen as it is shown (Ctrl+S): <label>_<date>_<time>.dpt, two columns "
-                                      "(wavelength nm, counts) that OPUS opens, plus a .json with the details, in <Save in>\\..\\spectra")
+        self.btn_save_spec.setToolTip("Save the current live scan (Ctrl+S) as a two-column .dpt plus a .json. "
+                                      "The export includes all detector channels and remembers the last chosen folder.")
         self.btn_save_spec.clicked.connect(self._save_spectrum); r.addWidget(self.btn_save_spec)
+        self.btn_repeat_spec = Q.QPushButton("Repeat save…")
+        self.btn_repeat_spec.setToolTip("Save a series of distinct live scans as .dpt and .json files.")
+        self.btn_repeat_spec.clicked.connect(self._toggle_repeat_save); r.addWidget(self.btn_repeat_spec)
+        self._repeat_timer = QtCore.QTimer(self)
+        self._repeat_timer.setSingleShot(True)
+        self._repeat_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self._repeat_timer.timeout.connect(self._save_next_spectrum)
         self.cb_spec_cur = Q.QCheckBox("Cursor")
         self.cb_spec_cur.setToolTip("Click or drag on a plot to read the wavelength. Arrow keys move one pixel, Shift+arrow ten.")
         r.addWidget(self.cb_spec_cur)
@@ -1016,15 +1171,14 @@ class Window(Q.QMainWindow):
         self.tabs.addTab(w, "Spectrum")
 
     def _draw_strip(self):
-        x = self._x() if self.latest is not None or self.axis is not None else None
+        x = self._x()[self._spectrum_channels()] if self.latest is not None or self.axis is not None else None
         if x is None or len(x) < 2:
             return
         xl = self.c_spec.ax[0].get_xlim()
         s = self.ax_strip; s.cla(); s.set_axis_off()
         s.imshow(theme.wavelength_rgb(x)[None, :, :], aspect="auto", extent=[x[0], x[-1], 0, 1], interpolation="bilinear")
         s.set_ylim(0, 1)
-        if not self.cb_auto.isChecked():
-            self.c_spec.ax[0].set_xlim(xl)
+        self.c_spec.ax[0].set_xlim(xl)
 
     def _tab_waterfall(self):
         w = Q.QWidget(); v = Q.QVBoxLayout(w); v.setContentsMargins(0, 6, 0, 0); r = Q.QHBoxLayout()
@@ -1041,15 +1195,21 @@ class Window(Q.QMainWindow):
         self.c_wf.ax[0].set_title("Recorded spectra over time")
         self.tabs.addTab(w, "Waterfall")
 
-    TS_SERIES = (("par", "420–700 nm rate", 1.4), ("rfr", "R:FR", 1.0), ("nirred", "NIR/red", 1.0),
-                 ("o2a", "O₂-A depth", 1.0), ("int", "Integration and scans", 1.0))
+    TS_SERIES = (("par", "420–700 nm rate", 1.4), ("rfr", "R:FR", 1.0), ("bg", "B:G", 1.0),
+                 ("frshare", "Far-red share", 1.0), ("nirred", "NIR/red", 1.0), ("o2a", "O₂-A depth", 1.0),
+                 ("int", "Integration and scans", 1.0))
+    TS_DEFAULTS = ("par", "rfr", "bg", "int")
 
     def _tab_timeseries(self):
         w = Q.QWidget(); v = Q.QVBoxLayout(w); v.setContentsMargins(0, 6, 0, 0)
         self.c_ts = Canvas(1, 1)
         r = Q.QHBoxLayout(); r.addWidget(plot_toolbar(self.c_ts, self)); r.addSpacing(12); r.addWidget(Q.QLabel("Show:"))
         saved = self.settings.value("ts_shown", None)
-        saved = [saved] if isinstance(saved, str) else (list(saved) if saved else [k for k, _, _ in self.TS_SERIES])
+        saved = [saved] if isinstance(saved, str) else (list(saved) if saved else self.TS_DEFAULTS)
+        if not self.settings.value("ts_defaults_044", False, type=bool):
+            if set(saved) == {"par", "rfr", "nirred", "o2a", "int"}:
+                saved = self.TS_DEFAULTS
+            self.settings.setValue("ts_defaults_044", True)
         self.ts_cbs = {}
         for k, lab, _ in self.TS_SERIES:
             cb = Q.QCheckBox(lab); cb.setChecked(k in saved); cb.toggled.connect(self._ts_layout); self.ts_cbs[k] = cb; r.addWidget(cb)
@@ -1074,6 +1234,7 @@ class Window(Q.QMainWindow):
             a = fig.add_subplot(gs[i, 0], sharex=axs[0] if axs else None); style_ax(a); axs.append(a)
         self.c_ts.ax = axs; self.ts_ax = dict(zip(keys, axs))
         titles = dict(par="420–700 nm rate (counts/s, instrument-relative)", rfr="R:FR counts (655–665 / 725–735)",
+                      bg="B:G counts (420–490 / 500–570 nm)", frshare="Far-red share of counts (700–750 / 400–750 nm)",
                       nirred="NIR/red (780–820 / 665–680)", o2a="O₂-A apparent depth (760 nm)", int="Integration time and scans per slot")
         for k, a in self.ts_ax.items():
             a.set_title(titles[k], loc="left", fontsize=9)
@@ -1169,6 +1330,9 @@ class Window(Q.QMainWindow):
         self.btn_dark.setEnabled(s in ("IDLE", "PREVIEW") and self.link is None)
         self.btn_start.setEnabled(s in ("IDLE", "PREVIEW") and self.link is None)
         self.btn_stop.setEnabled(self.link is not None and s in ("STANDBY", "RECORDING", "BURST", "AWAIT_UNCOVER"))
+        if s != "PREVIEW" and self._repeat_save is not None:
+            self._stop_repeat_save("Live preview stopped")
+        self.btn_repeat_spec.setEnabled(s == "PREVIEW" and self.link is None)
         self.a_open_run.setEnabled(self.run_dir is not None)
         # GammaKeeper behaviour: the setup panel steps aside while a run is being watched
         if s in RUN_STATES and prev not in RUN_STATES and self.link is not None:
@@ -1177,6 +1341,9 @@ class Window(Q.QMainWindow):
             self.statusBar().showMessage(detail)
 
     def _refresh_devices(self):
+        if self._spectrometer_live_open():
+            self.statusBar().showMessage("Close CzernyScope before refreshing devices.", 10000)
+            return
         if self.link is not None or live_sessions():
             self._log("device list not refreshed: a background recorder holds a spectrometer"); return
         devs, err = list_devices(True)
@@ -1187,6 +1354,9 @@ class Window(Q.QMainWindow):
             self._log(f"device search: {err}")
 
     def _connect(self):
+        if self._spectrometer_live_open():
+            self.statusBar().showMessage("Close CzernyScope before connecting here.", 10000)
+            return
         if self.state == "DISCONNECTED":
             self._pending_connect = time.time()
             self.engine.send("connect", self.dev_combo.currentData(), self.cb_edc.isChecked(), self.cb_nlc.isChecked())
@@ -1199,10 +1369,109 @@ class Window(Q.QMainWindow):
         self.engine.send("preview", on, self.exp_mode.currentIndex() == 0, self.int_spin.value() if self.exp_mode.currentIndex() == 1 else None)
 
     def _save_spectrum(self):
-        """The scan on screen, processed exactly as displayed, as <label>_<YYYY-MM-DD_HH-MM-SS>.dpt (two comma-separated
-        columns, wavelength and signal: what OPUS imports as a data point table) plus a .json with the details."""
         if self.latest is None or self.wl_dev is None:
             self.statusBar().showMessage("Nothing to save: start the live view first.", 8000); return
+        snapshot = self._spectrum_snapshot()
+        folder = self._spectrum_folder()
+        path = folder / f"{self._spectrum_stem(snapshot['time'])}.dpt"
+        if not self.auto_confirm:
+            chosen, _ = Q.QFileDialog.getSaveFileName(self, "Save spectrum as", str(path),
+                                                      "Data point table (*.dpt);;All files (*)",
+                                                      options=Q.QFileDialog.Option.DontConfirmOverwrite)
+            if not chosen:
+                return
+            path = Path(chosen) if Path(chosen).suffix else Path(chosen).with_suffix(".dpt")
+        if self._write_spectrum(path, snapshot):
+            self._remember_location("spectra_dir", str(path.parent))
+
+    def _spectrum_folder(self):
+        return Path(self._stored_location("spectra_dir") or
+                    QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.StandardLocation.DocumentsLocation))
+
+    def _spectrum_time(self):
+        return local_dt(int(self.latest_t)) if self.latest_t else dt.datetime.now(LOCAL_TZ)
+
+    def _spectrum_stem(self, t):
+        # Drop the leading date of the run name when it repeats the scan date.
+        name = Path(self.run_dir).name if self.run_dir else self.label_edit.text().strip()
+        name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_")
+        if name.startswith(f"{t:%Y-%m-%d}_"):
+            name = name[11:]
+        return f"{t:%Y-%m-%d_%H-%M-%S}_{name}" if name else f"{t:%Y-%m-%d_%H-%M-%S}"
+
+    def _toggle_repeat_save(self):
+        if self._repeat_save is not None:
+            self._stop_repeat_save("Stopped")
+            return
+        if self.state != "PREVIEW" or self.latest is None:
+            self.statusBar().showMessage("Start live view before saving a series.", 8000)
+            return
+        dialog = Q.QDialog(self)
+        dialog.setWindowTitle("Repeat save")
+        layout = Q.QFormLayout(dialog)
+        folder = Q.QLineEdit(str(self._spectrum_folder()))
+        browse = Q.QPushButton("Browse…")
+
+        def choose_folder():
+            chosen = Q.QFileDialog.getExistingDirectory(dialog, "Spectrum series folder", folder.text())
+            if chosen:
+                folder.setText(chosen)
+
+        browse.clicked.connect(choose_folder)
+        layout.addRow("Save in", hbox(folder, browse))
+        count = IntSpin(); count.setRange(2, 10000); count.setValue(10)
+        interval = dspin(0.1, 3600, 1, 1, 0.1, " s")
+        interval.setToolTip("Minimum time between saves. Each file uses a fresh scan; a slow exposure can extend the interval.")
+        layout.addRow("Scans", count)
+        layout.addRow("Interval", interval)
+        buttons = Q.QDialogButtonBox(Q.QDialogButtonBox.StandardButton.Ok | Q.QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(Q.QDialogButtonBox.StandardButton.Ok).setText("Start")
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() and folder.text().strip() and self.state == "PREVIEW" and self.latest is not None:
+            self._start_repeat_save(Path(folder.text().strip()), count.value(), interval.value())
+
+    def _start_repeat_save(self, folder, count, seconds):
+        self._repeat_save = dict(folder=folder, count=count, interval_ms=round(seconds * 1000),
+                                 saved=0, last=None, id=time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 10**9:09d}")
+        self.btn_repeat_spec.setText("Stop repeat")
+        self._save_next_spectrum()
+
+    def _stop_repeat_save(self, reason):
+        series, self._repeat_save = self._repeat_save, None
+        self._repeat_timer.stop()
+        self.btn_repeat_spec.setText("Repeat save…")
+        self.statusBar().showMessage(f"{reason}. Saved {series['saved']} of {series['count']} spectra.", 10000)
+
+    def _save_next_spectrum(self):
+        series = self._repeat_save
+        if series is None:
+            return
+        if self.state != "PREVIEW" or self.latest is None:
+            self._stop_repeat_save("Live preview stopped")
+            return
+        scan = self.latest_t
+        if scan is None or scan == series["last"]:
+            self._repeat_timer.start(75)
+            return
+        snapshot = self._spectrum_snapshot()
+        stem = self._spectrum_stem(snapshot["time"])
+        path = series["folder"] / f"{stem}_series_{series['id']}_{series['saved'] + 1:04d}.dpt"
+        if not self._write_spectrum(path, snapshot, series):
+            if self._repeat_save is not None:
+                self._stop_repeat_save("Repeat save failed")
+            return
+        if not series["saved"]:
+            self._remember_location("spectra_dir", str(series["folder"]))
+        series["last"] = scan
+        series["saved"] += 1
+        if series["saved"] >= series["count"]:
+            self._stop_repeat_save("Repeat save complete")
+        else:
+            self._repeat_timer.start(series["interval_ms"])
+
+    def _spectrum_snapshot(self):
+        """Capture the scan and settings before any file dialog can process newer scans."""
         us = int(self.latest_int or 0); raw = np.asarray(self.latest, float); y = raw.copy()
         d = self.darks.get(us); sub = self.cb_dark.isChecked() and d is not None
         if sub:
@@ -1213,53 +1482,65 @@ class Window(Q.QMainWindow):
         rate = self.cb_rate.isChecked() and us > 0
         if rate:
             y = y * 1e6 / us
-        x = self._x()
-        t = local_dt(int(self.latest_t)) if self.latest_t else dt.datetime.now(LOCAL_TZ)
-        # 0.3.10: <scan time>_<run name as in the header> (its leading date dropped when it repeats the scan's), else the label
-        name = Path(self.run_dir).name if getattr(self, "run_dir", None) else self.label_edit.text().strip()
-        name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_")
-        if name.startswith(f"{t:%Y-%m-%d}_"):
-            name = name[11:]
-        stem = f"{t:%Y-%m-%d_%H-%M-%S}_{name}" if name else f"{t:%Y-%m-%d_%H-%M-%S}"
-        folder = Path(str(self.settings.value("spectra_dir", "")) or
-                      QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.StandardLocation.DocumentsLocation))
-        path = folder / f"{stem}.dpt"; k = 2
-        while path.exists():
-            path = folder / f"{stem}_{k}.dpt"; k += 1
-        if not self.auto_confirm:
-            chosen, _ = Q.QFileDialog.getSaveFileName(self, "Save spectrum as", str(path), "Data point table (*.dpt);;All files (*)")
-            if not chosen:
-                return
-            path = Path(chosen) if Path(chosen).suffix else Path(chosen).with_suffix(".dpt")
+        return dict(time=self._spectrum_time(), integration=us, raw=raw, dark=d if sub else None,
+                    xy=np.column_stack((self._x(), y)), rate=rate, bridged=bridged, info=dict(self.info),
+                    axis=self.axis_label, plan=self._plan(), label=self.label_edit.text().strip())
+
+    def _write_spectrum(self, path, snapshot, series=None):
+        """Save one full detector readout and the selected processing metadata."""
+        t, us, plan = snapshot["time"], snapshot["integration"], snapshot["plan"]
+        d, rate, bridged = snapshot["dark"], snapshot["rate"], snapshot["bridged"]
+        sub = d is not None
+        info, axis = snapshot["info"], snapshot["axis"]
         folder = path.parent
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            self.settings.setValue("spectra_dir", str(folder))
-            plan = self._plan()
+            original = path
+            suffix = 2
+            while path.exists() or path.with_suffix(".json").exists():
+                path = folder / f"{original.stem}_{suffix}{original.suffix}"
+                suffix += 1
             meta = dict(app=f"{APP_NAME} {VERSION}", file=path.name, columns=["wavelength_nm", "counts_per_s" if rate else "counts"],
                         scan_time_local=t.isoformat(), integration_ms=us / 1000, scans_averaged=1,
-                        device={k_: self.info.get(k_) for k_ in ("model", "serial", "kind", "electric_dark_correction",
-                                                                 "nonlinearity_correction", "pixels")},
-                        wavelength_axis=self.axis_label, dark_subtracted=bool(sub), counts_per_second=bool(rate),
-                        hot_cold_pixels_bridged=bridged, label=self.label_edit.text().strip(), notes=plan.notes,
+                        device={key: info.get(key) for key in ("model", "serial", "kind", "electric_dark_correction",
+                                                               "nonlinearity_correction", "pixels")},
+                        wavelength_axis=axis, dark_subtracted=sub, counts_per_second=bool(rate),
+                        hot_cold_pixels_bridged=bridged, label=snapshot["label"], notes=plan.notes,
                         geometry=plan.geometry, setup={k_: getattr(plan, k_) for k_ in SETUP_FIELDS},
                         site=dict(lat=plan.site_lat, lon=plan.site_lon),
-                        raw_counts=[round(float(v), 2) for v in raw], dark_counts=[round(float(v), 2) for v in d] if sub else None)
+                        raw_counts=[round(float(v), 2) for v in snapshot["raw"]],
+                        dark_counts=[round(float(v), 2) for v in d] if sub else None)
+            if series:
+                meta["series"] = dict(id=series["id"], index=series["saved"] + 1, planned_scans=series["count"],
+                                      minimum_interval_s=series["interval_ms"] / 1000)
             hdr = [f"{APP_NAME} {VERSION} spectrum", f"scan {t:%Y-%m-%d %H:%M:%S %Z}, {us / 1000:g} ms, 1 scan",
-                   f"device {self.info.get('model', '')} {self.info.get('serial', '')}, electric dark "
-                   f"{self.info.get('electric_dark_correction')}, nonlinearity {self.info.get('nonlinearity_correction')}",
+                   f"device {info.get('model', '')} {info.get('serial', '')}, electric dark "
+                   f"{info.get('electric_dark_correction')}, nonlinearity {info.get('nonlinearity_correction')}",
                    f"{'dark-subtracted' if sub else 'raw (no dark subtracted)'}; {len(bridged)} hot/cold pixels bridged; "
-                   f"wavelength axis: {self.axis_label}",
+                   f"wavelength axis: {axis}",
                    f"label: {meta['label']}; geometry: {plan.geometry}; notes: {plan.notes}",
                    f"details: {path.with_suffix('.json').name}",
                    f"columns: wavelength_nm, {'counts_per_s' if rate else 'counts'}"]
-            np.savetxt(path, np.c_[x, y], delimiter=",", fmt=["%.4f", "%.4f"], header="\n".join(hdr), comments="# ")
-            path.with_suffix(".json").write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
+            sidecar = path.with_suffix(".json")
+            created = []
+            try:
+                with path.open("x", encoding="utf-8") as spectrum:
+                    created.append(path)
+                    with sidecar.open("x", encoding="utf-8") as details:
+                        created.append(sidecar)
+                        np.savetxt(spectrum, snapshot["xy"], delimiter=",", fmt=["%.4f", "%.4f"], header="\n".join(hdr), comments="# ")
+                        json.dump(meta, details, indent=1, default=str)
+            except Exception:
+                for incomplete in created:
+                    incomplete.unlink(missing_ok=True)
+                raise
         except Exception as e:
-            Q.QMessageBox.warning(self, APP_NAME, f"Spectrum not saved: {e!r}"); return
+            Q.QMessageBox.warning(self, APP_NAME, f"Spectrum not saved: {e!r}")
+            return False
         self._log(f"spectrum saved: {path} ({us / 1000:g} ms, {'dark-subtracted' if sub else 'raw'}"
                   f"{', ' + str(len(bridged)) + ' hot/cold pixels bridged' if bridged else ''})")
         self.statusBar().showMessage(f"Saved {path.name} in {folder}", 10000)
+        return True
 
     def _site_changed(self):
         """A new site changes every sun time: say so, then redraw the schedule (it used to wait for the 30 s refresh)."""
@@ -1277,7 +1558,7 @@ class Window(Q.QMainWindow):
     def _run_metas(self) -> list:
         """Metadata of the runs in the Save in folder, oldest first ('_folder' and '_dir' added)."""
         metas = []
-        for root in (self.out_edit.text(), str(self.settings.value("setup_fallback_dir", "") or "")):   # after moving to an empty folder
+        for root in (self._output_dir(), self._stored_location("setup_fallback_dir")):
             try:
                 for d in Path(root).iterdir() if root else ():
                     m = read_json(d / "run_metadata.json") if d.is_dir() else None
@@ -1378,14 +1659,16 @@ class Window(Q.QMainWindow):
         self.engine.send("preview", self.state == "PREVIEW", self.exp_mode.currentIndex() == 0, self.int_spin.value())
 
     def _plan(self) -> RunPlan:
-        for k, v in (("out_dir", self.out_edit.text()), ("site_lat", self.lat.value()), ("site_lon", self.lon.value())):
+        for k, v in (("site_lat", self.lat.value()), ("site_lon", self.lon.value())):
             self.settings.setValue(k, v)
+        out_dir = self._output_dir()
+        location = self._out_location if self.out_edit.text() == self._out_text else remember_path(out_dir)
         try:
             ladder = [float(x) for x in self.ladder_edit.text().replace(";", ",").split(",") if x.strip()]
         except ValueError:
             ladder = list(DEFAULT_LADDER_MS)
         return RunPlan(label=self.label_edit.text().strip() or "run", notes=self.notes_edit.text(), geometry=self.geom_edit.text(),
-                       out_dir=self.out_edit.text(), start_now=self.start_mode.currentIndex() == 0,
+                       out_dir=out_dir, out_dir_location=location, start_now=self.start_mode.currentIndex() == 0,
                        start_event=self.start_event.currentText() if self.start_mode.currentIndex() == 2 else "",
                        start_offset_min=self.start_off.value(),
                        stop_event=self.stop_event.currentText() if self.stop_mode.currentIndex() == 1 else "",
@@ -1419,7 +1702,11 @@ class Window(Q.QMainWindow):
         return box.clickedButton() is bo
 
     def _start_run(self):
+        self._commit_output_location()
         plan = self._plan()
+        if not plan.out_dir:
+            Q.QMessageBox.warning(self, APP_NAME, "Reconnect the saved data drive or choose a folder in Save in.")
+            return
         bad = site_problem(plan.site_lat, plan.site_lon) if (plan.start_event or plan.stop_event) else ""
         if bad and (plan.site_lat, plan.site_lon) == (0.0, 0.0):
             Q.QMessageBox.warning(self, APP_NAME, bad + "\n\nSet the latitude and longitude under Show advanced settings → Site.")
@@ -1538,7 +1825,7 @@ class Window(Q.QMainWindow):
                 self._handle(e)
                 if src is not self.engine and self.link is not src:   # detached while handling
                     break
-        if self._scan_new and time.time() - self._last_live > 0.2:
+        if self._scan_new and time.time() - self._last_live > 0.2 and not self._scrolling_setup():
             self._draw_live()
 
     def _handle(self, e):
@@ -1573,6 +1860,11 @@ class Window(Q.QMainWindow):
             elif t == "need_post_dark":
                 QtCore.QTimer.singleShot(50, self._ask_post_dark)
             elif t == "device":
+                if self.info.get("serial") != e["info"].get("serial") or not np.array_equal(self.wl_dev, e["wavelengths"]):
+                    self.latest = self.latest_int = self.latest_t = None
+                    self.darks = {}
+                    self._scan_new = False
+                    self._edge_layout = None
                 self.info = e["info"]; self.wl_dev = np.asarray(e["wavelengths"]); self.axis = self.wl_dev.copy(); self.valid = np.ones(len(self.axis), bool)
                 self.hot = None   # the engine follows with this spectrometer's saved list, if it has one
                 i = self.info
@@ -1783,7 +2075,7 @@ class Window(Q.QMainWindow):
             if not ok:
                 return
             r = runs[names.index(item)]; self._resume(r["run_dir"], r["state"].get("serial", "")); return
-        d = Q.QFileDialog.getExistingDirectory(self, "Run folder to resume (contains run_state.json)", self.out_edit.text())
+        d = Q.QFileDialog.getExistingDirectory(self, "Run folder to resume (contains run_state.json)", self._output_dir())
         if not d:
             return
         st = read_json(Path(d) / "run_state.json")
@@ -1792,6 +2084,9 @@ class Window(Q.QMainWindow):
         self._resume(d, st.get("serial", ""))
 
     def _resume(self, run_dir, serial):
+        if self._spectrometer_live_open():
+            Q.QMessageBox.information(self, APP_NAME, "Close CzernyScope before resuming a recording.")
+            return
         if self._try_attach(serial):
             return
         self._release_local_device()
@@ -1818,13 +2113,14 @@ class Window(Q.QMainWindow):
         threading.Thread(target=job, daemon=True, name="LightKeeperWeather").start()
 
     def _weather_sweep(self):
-        dirs = weather.missing_runs(self.out_edit.text())
+        root = self._output_dir()
+        dirs = weather.missing_runs(root) if root else []
         if dirs:
             self._log(f"fetching weather for {', '.join(d.name for d in dirs)}")
             self._fetch_weather(dirs)
 
     def _weather_dialog(self):
-        d = Q.QFileDialog.getExistingDirectory(self, "Fetch weather for this run folder", self.out_edit.text())
+        d = Q.QFileDialog.getExistingDirectory(self, "Fetch weather for this run folder", self._output_dir())
         if d:
             self._log(f"fetching weather for {Path(d).name} (sends the site, rounded to two decimals, and the dates)")
             self._fetch_weather([d])
@@ -1848,10 +2144,16 @@ class Window(Q.QMainWindow):
             self._last_auto_try = time.time(); self._auto_connect(rescan=True)    # a spectrometer plugged in later
         nxt = self._next_event()
         self.next_lbl.setText(nxt)
+        if self._scrolling_setup():
+            return
         if self._dirty_ts and time.time() - self._last_ts_draw > 4:
             self._dirty_ts = False; self._last_ts_draw = time.time(); self._draw_timeseries(); self._draw_waterfall()
         if int(time.time()) % 30 == 0:
             self._update_schedule()
+
+    def _scrolling_setup(self):
+        return (self.setup.isVisible() and (self.setup_scroll.verticalScrollBar().isSliderDown()
+                                           or time.monotonic() - self._setup_scrolled < 0.15))
 
     def _next_event(self) -> str:
         now = dt.datetime.now(LOCAL_TZ)
@@ -1876,16 +2178,16 @@ class Window(Q.QMainWindow):
             return (mean - base) / (int_us / 1e6)
         return (mean - d) / (int_us / 1e6)
 
-    def _band(self, r, a, b):
-        m = (self.axis >= a) & (self.axis <= b) & self.valid
-        return float(np.mean(r[m])) if m.any() else np.nan
-
     def _on_slot(self, e):
         r = self._rate(np.asarray(e["mean"], float), e["int_us"])
-        o2 = self._band(r, 759.8, 761.0); sh = 0.5 * (self._band(r, 753.5, 756.0) + self._band(r, 769.5, 772.0))
+        metrics = runview.band_metrics(r[None, :], runview.band_masks(self.axis, self.valid))
+        bg = frshare = np.nan
+        if not e["nsat"] and int(e["int_us"]) in self.darks:
+            weights = runview.broad_band_weights(self.axis, self.valid)
+            blue_green, far_red_share = runview.broad_metrics(r[None, :], weights, np.ones(1, bool))
+            bg, frshare = float(blue_green[0]), float(far_red_share[0])
         self.slots.append(dict(t=local_dt(e["t_ns"]), int_ms=e["int_us"] / 1000, n=e["n"], peak=e["bmax"], nsat=e["nsat"],
-                               par=self._band(r, 420, 700), rfr=self._band(r, 655, 665) / self._band(r, 725, 735),
-                               nirred=self._band(r, 780, 820) / self._band(r, 665, 680), o2a=1 - o2 / sh if sh else np.nan))
+                               **{name: float(values[0]) for name, values in metrics.items()}, bg=bg, frshare=frshare))
         self._slot_count += 1
         if self._slot_count % self.spec_stride == 0:
             self.spectra.append((local_dt(e["t_ns"]), r.astype(np.float32), np.asarray(e["mean"], np.float32)))
@@ -1923,7 +2225,35 @@ class Window(Q.QMainWindow):
 
     # =================================================================== drawing
     def _x(self):
+        if self.viewing is not None and self.latest is None:
+            return self.viewing["wl"]
         return self.axis if self.axis is not None else np.arange(len(self.latest))
+
+    def _spectrum_channels(self, recorded=False):
+        if self.cb_edges.isChecked():
+            return slice(None)
+        if self.viewing is not None and (recorded or self.latest is None):
+            x = self.viewing["wl"]
+            model = self.viewing.get("model", "")
+            raw = self.spectra[-1][2] if self.spectra else None
+        else:
+            x = self._x()
+            model = self.info.get("model", "")
+            raw = self.latest if self.latest is not None else (self.spectra[-1][2] if self.spectra else None)
+        key = (model, len(x), float(x[0]), float(x[-1]))
+        if self._edge_layout is not None and self._edge_layout[0] == key:
+            return self._edge_layout[1]
+        channels = display.display_channels(model, len(x), raw)
+        if channels.start is not None:
+            self._edge_layout = (key, channels)
+        return channels
+
+    def _spectrum_mask(self, n, valid, recorded=False):
+        show = np.zeros(n, bool)
+        show[self._spectrum_channels(recorded)] = True
+        if self.cb_mask.isChecked() and valid is not None and len(valid) == n:
+            show &= valid
+        return show
 
     def _draw_live(self, force=False):
         if self.latest is None:
@@ -1931,7 +2261,8 @@ class Window(Q.QMainWindow):
         self._scan_new = False; self._last_live = time.time()
         y = np.asarray(self.latest, float); x = self._x(); us = self.latest_int or 1
         d = self.darks.get(int(us))
-        show = self.valid if (self.cb_mask.isChecked() and self.valid is not None) else np.ones(len(y), bool)
+        channels = self._spectrum_channels()
+        show = self._spectrum_mask(len(y), self.valid)
         yy = y - d if (self.cb_dark.isChecked() and d is not None) else y
         k = 1e6 / us if self.cb_rate.isChecked() else 1.0
         a0, a1 = self.c_spec.ax
@@ -1944,20 +2275,22 @@ class Window(Q.QMainWindow):
         a0.set_yscale("log" if self.cb_log.isChecked() else "linear"); a0.set_ylabel("Counts/s" if k != 1 else "Counts")
         if not self.cb_log.isChecked():
             a0.yaxis.set_major_formatter(THOUSANDS)
-        key = (len(x), float(x[0]), float(x[-1]))
+        xx = x[channels]
+        key = (len(xx), float(xx[0]), float(xx[-1]))
         if force or getattr(self, "_strip_key", None) != key:
             self._strip_key = key; self._draw_strip()
         self._live_shown = (yy * k, show, "counts/s" if k != 1 else "counts")
         if self.cb_auto.isChecked():
-            a0.set_xlim(x[0], x[-1]); self._fit_y(a0)
+            a0.set_xlim(xx[0], xx[-1]); self._fit_y(a0)
         elif self._full_hold:
             self._apply_full_scale()
         peak = float(np.max(y[show])) if show.any() else 0
-        hidden = int((~show).sum())
+        hidden = int((~show[channels]).sum())
+        edge_info = f", {len(x) - len(xx)} terminal channels hidden" if len(xx) < len(x) else ""
         self.live_info.setText(f"{us / 1000:g} ms, peak {peak:,.0f} counts, {'matched dark available' if d is not None else 'no matched dark'}, "
                                + (f"{hidden} hot/cold pixels hidden, " if hidden else
                                   ("hot pixels shown, " if not self.cb_mask.isChecked() else "no hot-pixel list (take a dark set), "))
-                               + self.axis_label)
+                               + self.axis_label + edge_info)
         if force or len(self.spectra) and getattr(self, "_drawn_spec", 0) != len(self.spectra):
             self._draw_recent()
         self.spec_cursor.sync(); self._spec_cursor_text()
@@ -1968,10 +2301,13 @@ class Window(Q.QMainWindow):
         the start of usable light to the newest slot; at the far right it stays on the newest slot as new ones arrive."""
         if self.axis is None and self.latest is None:
             return
-        x = self._x(); a0, a1 = self.c_spec.ax
+        x = self.viewing["wl"] if self.viewing is not None else self._x()
+        a0, a1 = self.c_spec.ax
         if self.latest is None and self.cb_auto.isChecked():          # a recorded run with no live scan above it
-            a0.set_xlim(x[0], x[-1]); self._strip_key = None; self._draw_strip()
-        show = self.valid if (self.cb_mask.isChecked() and self.valid is not None and len(self.valid) == len(x)) else np.ones(len(x), bool)
+            xx = x[self._spectrum_channels(recorded=True)]
+            a0.set_xlim(xx[0], xx[-1]); self._strip_key = None; self._draw_strip()
+        valid = self.viewing["valid"] if self.viewing is not None else self.valid
+        show = self._spectrum_mask(len(x), valid, recorded=True)
         xl = a0.get_xlim()
         first, i = self._sync_scrub()
         recent = self.spectra[max(first, i - 23):i + 1] if self.spectra else []
@@ -2045,8 +2381,10 @@ class Window(Q.QMainWindow):
         xs = self._cursor_pixels(); parts = [f"<b>{float(xs[i]):.2f} nm</b> (pixel {i})"]
         if self._live_shown is not None and i < len(self._live_shown[0]):
             v, show, unit = self._live_shown
-            parts.append(f"live {v[i]:,.1f} {unit}" if show[i] else "live: hidden hot/cold pixel")
-        if self._recent_full is not None and i < len(self._recent_full[1]):
+            hidden = "terminal channel" if i not in range(len(xs))[self._spectrum_channels()] else "hot/cold pixel"
+            parts.append(f"live {v[i]:,.1f} {unit}" if show[i] else f"live: hidden {hidden}")
+        if (self._recent_full is not None and i < len(self._recent_full[1])
+                and (self.viewing is None or self.latest is None or np.array_equal(self.viewing["wl"], xs))):
             t, v, show = self._recent_full
             parts.append(f"{t:%H:%M:%S} slot {v[i]:,.1f} counts/s" if show[i] else f"{t:%H:%M:%S} slot: hidden pixel")
         return parts
@@ -2157,7 +2495,7 @@ class Window(Q.QMainWindow):
         """0.4.2: the whole spectrum against the detector's full range, held while the live view updates."""
         if self.latest is None and self.axis is None:
             return
-        x = self._x(); a0 = self.c_spec.ax[0]
+        x = self._x()[self._spectrum_channels()]; a0 = self.c_spec.ax[0]
         a0.set_xlim(float(x[0]), float(x[-1]))
         self._manual_view(); self._full_hold = True
         self._apply_full_scale(); self.spec_cursor.sync(); self.c_spec.draw_idle()
@@ -2182,6 +2520,21 @@ class Window(Q.QMainWindow):
         self._fit_y(a0, xl); self._fit_y(a1, xl); self._a1_ylim = a1.get_ylim()
         self.c_spec.draw_idle()
 
+    def _fit_xy_now(self):
+        if self.latest is None and self.axis is None:
+            return
+        self._full_hold = False
+        self._a1_ylim = None
+        x = self._x()[self._spectrum_channels()]
+        self.c_spec.ax[0].set_xlim(float(x[0]), float(x[-1]))
+        if self.latest is not None:
+            self._draw_live(force=True)
+        else:
+            self._draw_strip()
+            self._draw_recent()
+        self._fit_y_now()
+        self.spec_cursor.sync()
+
     def _draw_timeseries(self):
         if not self.slots:
             return
@@ -2199,6 +2552,13 @@ class Window(Q.QMainWindow):
             a.set_title(tag("par", "420–700 nm rate (counts/s, instrument-relative)"), loc="left", fontsize=9)
         if "rfr" in A:
             A["rfr"].plot(t, [s["rfr"] for s in S], color=RED, lw=0.8); A["rfr"].set_title(tag("rfr", "R:FR counts (655–665 / 725–735)"), loc="left", fontsize=9)
+        if "bg" in A:
+            A["bg"].plot(t, [s.get("bg", np.nan) for s in S], color=BLUE, lw=0.8)
+            A["bg"].set_title(tag("bg", "B:G counts (420–490 / 500–570 nm)"), loc="left", fontsize=9)
+        if "frshare" in A:
+            A["frshare"].plot(t, [100 * s.get("frshare", np.nan) for s in S], color=PURPLE, lw=0.8)
+            A["frshare"].set_title(tag("frshare", "Far-red share of counts (700–750 / 400–750 nm)"), loc="left", fontsize=9)
+            A["frshare"].set_ylabel("%")
         if "nirred" in A:
             A["nirred"].plot(t, [s["nirred"] for s in S], color=TEAL, lw=0.8); A["nirred"].set_title(tag("nirred", "NIR/red (780–820 / 665–680)"), loc="left", fontsize=9)
         if "o2a" in A:
@@ -2232,9 +2592,12 @@ class Window(Q.QMainWindow):
         a = self.c_wf.ax[0]; a.cla(); style_ax(a)
         mode = self.wf_mode.currentIndex()
         R = np.array([sp[2 if mode == 3 else 1] for sp in shown], float); t = [sp[0] for sp in shown]
-        if self.cb_mask.isChecked() and self.valid is not None:
-            R = hotpix.fill(R, self.valid)
-        x = self.axis; m = (x > 380) & (x < 1050)
+        valid = self.viewing["valid"] if self.viewing is not None else self.valid
+        if mode != 3 and self.cb_mask.isChecked() and valid is not None:
+            R = hotpix.fill(R, valid)
+        x = self.viewing["wl"] if self.viewing is not None else self.axis
+        axis_label = "device axis" if self.viewing is not None else self.axis_label
+        m = (x > 380) & (x < 1050)
         with np.errstate(divide="ignore", invalid="ignore"):
             if mode == 3:
                 Z = R; lab = "counts per scan, no dark subtraction or scaling"
@@ -2249,7 +2612,7 @@ class Window(Q.QMainWindow):
         tn = mdates.date2num(t)
         im = a.imshow(Z, aspect="auto", origin="lower", extent=[x[m][0], x[m][-1], tn[0], tn[-1]], cmap="magma", vmin=lo, vmax=hi, interpolation="nearest")
         a.yaxis_date(tz=LOCAL_TZ); a.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=LOCAL_TZ))
-        a.set_xlabel(f"wavelength (nm, {self.axis_label})"); a.set_title(f"Recorded spectra over time ({len(shown)} shown, every {self.spec_stride} slot(s)) · {rtxt}", loc="left")
+        a.set_xlabel(f"wavelength (nm, {axis_label})"); a.set_title(f"Recorded spectra over time ({len(shown)} shown, every {self.spec_stride} slot(s)) · {rtxt}", loc="left")
         if self.wf_cbar is not None:
             try:
                 self.wf_cbar.remove()
@@ -2432,7 +2795,11 @@ class Window(Q.QMainWindow):
         r = self.cal_result
         if not r or not r.get("ok"):
             Q.QMessageBox.information(self, APP_NAME, "Fit a calibration first."); return
-        folder = Path(self.out_edit.text()).parent / "calibrations"
+        root = self._output_dir()
+        if not root:
+            Q.QMessageBox.warning(self, APP_NAME, "Reconnect the saved data drive or choose a folder in Save in.")
+            return
+        folder = Path(root).parent / "calibrations"
         lamp = self.cal["lamp"]
         meta = dict(app=f"{APP_NAME} {VERSION}", device=self.info, lamp_int_us=lamp["int_us"], lamp_scans=lamp["n"],
                     lamp_time_local=local_dt(lamp["t_ns"]).isoformat(), dark=self._cal_matched_dark() is not None,
@@ -2451,7 +2818,9 @@ class Window(Q.QMainWindow):
         self._log(f"display axis -> {self.axis_label}"); self._draw_live(force=True)
 
     def _cal_load(self):
-        fn, _ = Q.QFileDialog.getOpenFileName(self, "Load calibration.json", str(Path(self.out_edit.text()).parent / "calibrations"), "calibration.json (*.json)")
+        root = self._output_dir()
+        folder = str(Path(root).parent / "calibrations") if root else ""
+        fn, _ = Q.QFileDialog.getOpenFileName(self, "Load calibration.json", folder, "calibration.json (*.json)")
         if fn:
             r = json.loads(Path(fn).read_text())["result"]; self.cal_result = r; self._cal_use(r)
 

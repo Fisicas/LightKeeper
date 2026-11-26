@@ -12,7 +12,10 @@ import sys
 import tempfile
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +57,8 @@ class Rules(Base):
     def test_dead_open_run_is_resumed(self):
         d = self.fake_run()
         self.assertEqual(len(self.dog.run_once()), 1)
-        self.assertEqual(self.spawned[0][-3:], ["--supervisor", "--resume", str(d)])
+        self.assertEqual(self.spawned[0][-4:], ["--resume-source", "watchdog", "--resume", str(d)])
+        self.assertEqual(self.spawned[0][-6:-4], ["--registration-id", self.procs.open_runs()[0]["registration_id"]])
 
     def test_nothing_open_removes_the_task(self):
         self.assertEqual(self.dog.run_once(), ["task False"])
@@ -134,15 +138,133 @@ class Rules(Base):
 
 
 class LogonEntry(Base):
-    def test_supervisor_removes_the_entry_of_a_closed_run(self):
-        import winreg
-        d = self.fake_run("logon_entry_selfclean", status="closed")
-        name = self.procs._run_value(d)
-        self.assertIn("logon resume set", self.procs.set_logon_resume(d, True))
-        subprocess.run([sys.executable, "-X", "utf8", str(ROOT / "LightKeeper.py"), "--supervisor", "--resume", str(d)], timeout=30)
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.procs.RUN_KEY) as k:
-            with self.assertRaises(FileNotFoundError):
-                winreg.QueryValueEx(k, name)
+    def test_migration_removes_only_legacy_lightkeeper_resume_values(self):
+        from unittest.mock import MagicMock
+
+        winreg = MagicMock(KEY_READ=1, KEY_SET_VALUE=2)
+        key = winreg.OpenKey.return_value.__enter__.return_value
+        command = '"C:\\Python\\pythonw.exe" "C:\\LightKeeper\\LightKeeper.py" "--supervisor" "--resume" "O:\\r1"'
+        winreg.QueryInfoKey.return_value = (0, 3, 0)
+        winreg.EnumValue.side_effect = [
+            ("OtherApplication", "other.exe", 1),
+            ("LightKeeperResume_unrelated", "unrelated.exe", 1),
+            ("LightKeeperResume_r1", command, 1),
+        ]
+        with patch.dict(sys.modules, winreg=winreg), patch.dict(os.environ):
+            os.environ.pop("LIGHTKEEPER_HOME", None)
+            self.procs.remove_legacy_logon_entries()
+        winreg.DeleteValue.assert_called_once_with(key, "LightKeeperResume_r1")
+        winreg.SetValueEx.assert_not_called()
+
+    def test_task_dispatches_watchdog_at_sign_in_and_while_running(self):
+        sid = "S-1-5-21-123-456-789-1001"
+        task = ET.fromstring(self.procs._watchdog_xml(sid))
+        ns = {"task": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        self.assertIsNotNone(task.find("task:Triggers/task:LogonTrigger", ns))
+        self.assertEqual(task.find("task:Triggers/task:LogonTrigger/task:UserId", ns).text, sid)
+        self.assertEqual(task.find("task:Principals/task:Principal/task:UserId", ns).text, sid)
+        self.assertIsNone(task.find("task:Triggers/task:LogonTrigger/task:Delay", ns))
+        self.assertIsNotNone(task.find("task:Triggers/task:TimeTrigger", ns))
+        self.assertEqual(task.find(".//task:MultipleInstancesPolicy", ns).text, "IgnoreNew")
+        self.assertEqual(task.find(".//task:DisallowStartIfOnBatteries", ns).text, "false")
+        self.assertEqual(task.find(".//task:StopIfGoingOnBatteries", ns).text, "false")
+        self.assertEqual(task.find(".//task:LogonType", ns).text, "InteractiveToken")
+        self.assertEqual(task.find(".//task:Command", ns).text, self.procs.gui_python())
+        self.assertTrue(Path(self.procs.gui_python()).is_absolute())
+        self.assertEqual(task.find(".//task:WorkingDirectory", ns).text, str(ROOT))
+        args = task.find(".//task:Arguments", ns).text
+        self.assertIn(str(ROOT / "LightKeeper.py"), args)
+        self.assertIn("--watchdog", args)
+
+
+class WindowsRestart(Base):
+    def setUp(self):
+        super().setUp()
+        self.spawned = []
+        self.dog.spawn_detached = lambda args, log=None: self.spawned.append(args)
+        self.dog.set_watchdog_task = lambda on: f"task {on}"
+        self.boot = patch.object(self.procs, "windows_boot_time", return_value=10000)
+        self.boot.start()
+        self.addCleanup(self.boot.stop)
+
+    def journal(self, *, phase="RECORDING", opt_in=True, status="open", stop_h=1, boot_id=None):
+        path = self.fake_run(status=status, stop_h=stop_h)
+        state = self.procs.read_json(path / "run_state.json")
+        state["phase"] = phase
+        self.procs.write_json_atomic(path / "run_state.json", state)
+        self.procs.register_open_run(path, state["serial"], recovery=dict(
+            boot_id=boot_id, boot_time=9000, auto_resume_logon=opt_in, planned_stop_local=state["planned_stop_local"]))
+        return path
+
+    def test_watchdog_waits_for_the_volume_then_resumes_the_armed_run(self):
+        path = self.journal(phase="STANDBY")
+        record = self.procs.open_runs()[0]
+        with patch.object(self.procs, "open_runs", return_value=[dict(record, state=None)]):
+            self.assertEqual(self.dog.run_once(), [])
+            self.assertEqual(self.spawned, [])
+        self.dog.run_once()
+        self.assertEqual(self.spawned[0][-4:], ["--resume-source", "windows_restart", "--resume", str(path)])
+
+    def test_opt_out_survives_across_boot(self):
+        self.journal(opt_in=False)
+        self.assertEqual(self.dog.run_once(), ["task False"])
+        self.assertEqual(self.spawned, [])
+
+    def test_wall_clock_step_during_same_boot_preserves_watchdog_recovery(self):
+        path = self.journal(opt_in=False, boot_id="previous-boot")
+        # The estimated wall-clock boot time moved from 9000 to 10000, but the boot did not change.
+        with patch.object(self.procs, "windows_boot_id", return_value="previous-boot"):
+            self.dog.run_once()
+        self.assertEqual(self.spawned[0][-4:], ["--resume-source", "watchdog", "--resume", str(path)])
+
+    def test_new_boot_is_detected_even_when_estimated_time_differs_by_one_second(self):
+        path = self.journal(boot_id="previous-boot")
+        with patch.object(self.procs, "windows_boot_id", return_value="new-boot"), \
+                patch.object(self.procs, "windows_boot_time", return_value=9001):
+            self.dog.run_once()
+        self.assertEqual(self.spawned[0][-4:], ["--resume-source", "windows_restart", "--resume", str(path)])
+
+    def test_boot_event_unavailable_preserves_legacy_time_fallback(self):
+        path = self.journal(boot_id="previous-boot")
+        with patch.object(self.procs, "windows_boot_id", return_value=None):
+            self.dog.run_once()
+        self.assertEqual(self.spawned[0][-4:], ["--resume-source", "windows_restart", "--resume", str(path)])
+
+    def test_post_run_and_awaiting_uncover_do_not_resume_at_sign_in(self):
+        for phase in ("POST_RUN", "AWAIT_UNCOVER"):
+            with self.subTest(phase=phase):
+                path = self.journal(phase=phase)
+                self.assertEqual(self.dog.run_once(), ["task False"])
+                self.assertEqual(self.spawned, [])
+                self.procs.unregister_open_run(path)
+                (path / "run_state.json").unlink()
+                path.rmdir()
+
+    def test_past_stop_does_not_resume_at_sign_in(self):
+        self.journal(stop_h=-0.1)
+        self.assertEqual(self.dog.run_once(), ["task False"])
+        self.assertEqual(self.spawned, [])
+
+    def test_reused_pid_does_not_block_recovery(self):
+        path = self.journal()
+        yesterday = dt.datetime.now().astimezone() - dt.timedelta(days=1)
+        self.procs.write_json_atomic(path / "supervisor.json", dict(pid=os.getpid(), started=yesterday.isoformat()))
+        self.assertEqual(len(self.dog.run_once()), 1)
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_window_opens_once_after_acquisition_is_ready(self):
+        from lightkeeper.recorder import Recorder
+
+        recorder = SimpleNamespace(
+            run={"t_stop": dt.datetime.now().astimezone().isoformat()}, run_dir=self.out,
+            state="WAITING_DEVICE", _show_recovered_run=True, _set_state=Mock(), _note=Mock())
+        with patch("lightkeeper.recorder.spawn_detached") as launch:
+            Recorder._apply(recorder, {"state": "WAITING_DEVICE"}, "state")
+            launch.assert_not_called()
+            Recorder._apply(recorder, {"state": "RECORDING"}, "state")
+            Recorder._apply(recorder, {"state": "RECORDING"}, "state")
+            launch.assert_called_once()
+            self.assertEqual(launch.call_args.args[0], self.procs.entry_args())
 
 
 class EndToEnd(Base):
